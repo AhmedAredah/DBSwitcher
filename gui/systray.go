@@ -92,12 +92,18 @@ func onTrayReady() {
 				// Stop MariaDB
 				core.AppLogger.Log("Stop MariaDB clicked from tray")
 				go func() {
-					creds := core.GetDefaultCredentials()
+					creds := core.GetCredentialsForRunningInstance()
 					err := core.StopMySQLWithCredentials(creds)
-					if err != nil {
-						core.AppLogger.Log("Failed to stop MariaDB: %v", err)
-					} else {
+					switch {
+					case err == nil:
 						core.AppLogger.Log("MariaDB stopped successfully from tray")
+					case core.IsCredentialError(err):
+						// Nothing to type into from the tray, so say plainly
+						// that the stored credentials need updating.
+						core.AppLogger.Error("Saved credentials were rejected: %s", core.ClientOutput(err))
+						core.NotifyMariaDBError("Stored MySQL credentials were rejected - update them in Credentials")
+					default:
+						core.AppLogger.Log("Failed to stop MariaDB: %v", err)
 					}
 				}()
 

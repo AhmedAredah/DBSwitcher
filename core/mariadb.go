@@ -2,6 +2,7 @@ package core
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -13,67 +14,68 @@ import (
 	"time"
 )
 
+// ProcessInfo describes a running database server process.
+type ProcessInfo struct {
+	PID         int
+	CommandLine string
+}
+
 // GetMariaDBStatus returns the current MariaDB status
 func GetMariaDBStatus() MariaDBStatus {
 	status := MariaDBStatus{
 		IsRunning: false,
 	}
 
-	// Check if MariaDB is running
-	status.IsRunning = IsMariaDBRunning()
-	
+	proc, found := FindServerProcess()
+	status.IsRunning = found
+
 	if !status.IsRunning {
 		return status
 	}
 
-	// Get process details
-	processName := AppConfig.ProcessNames[runtime.GOOS]
-	if processName == "" {
-		processName = "mysqld"
+	status.ProcessID = proc.PID
+
+	// Log the command line for debugging
+	AppLogger.Debug("Found MariaDB process with command line: %s", proc.CommandLine)
+
+	// Extract config file from command line
+	configFile := extractConfigFromCmdLine(proc.CommandLine)
+	AppLogger.Debug(" Extracted config file: '%s'", configFile)
+
+	if configFile != "" {
+		status.ConfigFile = configFile
+
+		// Normalize the config file path for comparison
+		normalizedConfigFile := filepath.Clean(configFile)
+
+		// Find matching config in our list
+		for _, cfg := range AvailableConfigs {
+			normalizedCfgPath := filepath.Clean(cfg.Path)
+			AppLogger.Debug(" Comparing '%s' with '%s'", normalizedConfigFile, normalizedCfgPath)
+
+			if normalizedCfgPath == normalizedConfigFile {
+				status.ConfigName = cfg.Name
+				status.Port = cfg.Port
+				status.DataPath = cfg.DataDir
+				AppLogger.Debug(" Matched config: %s, Port: %s", cfg.Name, cfg.Port)
+				break
+			}
+		}
+
+		if status.ConfigName == "" {
+			AppLogger.Debug("No matching config found for file: %s", configFile)
+			AppLogger.Debug(" Available configs:")
+			for _, cfg := range AvailableConfigs {
+				AppLogger.Debug("   - %s: %s", cfg.Name, filepath.Clean(cfg.Path))
+			}
+		}
 	}
 
-	pid, cmdLine, found := FindProcessWithCmdLine(processName)
-	if found {
-		status.ProcessID = pid
-		
-		// Log the command line for debugging
-		AppLogger.Debug("Found MariaDB process with command line: %s", cmdLine)
-		
-		// Extract config file from command line
-		configFile := extractConfigFromCmdLine(cmdLine)
-		AppLogger.Debug(" Extracted config file: '%s'", configFile)
-		
-		if configFile != "" {
-			status.ConfigFile = configFile
-			
-			// Normalize the config file path for comparison
-			normalizedConfigFile := filepath.Clean(configFile)
-			
-			// Find matching config in our list
-			for _, cfg := range AvailableConfigs {
-				normalizedCfgPath := filepath.Clean(cfg.Path)
-				AppLogger.Debug(" Comparing '%s' with '%s'", normalizedConfigFile, normalizedCfgPath)
-				
-				if normalizedCfgPath == normalizedConfigFile {
-					status.ConfigName = cfg.Name
-					status.Port = cfg.Port
-					status.DataPath = cfg.DataDir
-					AppLogger.Debug(" Matched config: %s, Port: %s", cfg.Name, cfg.Port)
-					break
-				}
-			}
-			
-			if status.ConfigName == "" {
-				AppLogger.Debug("No matching config found for file: %s", configFile)
-				AppLogger.Debug(" Available configs:")
-				for _, cfg := range AvailableConfigs {
-					AppLogger.Debug("   - %s: %s", cfg.Name, filepath.Clean(cfg.Path))
-				}
-			}
-		} else {
-			AppLogger.Debug(" No config file found in command line")
-			// If no config file, try to get port from running instance
-			status.Port = getCurrentPort()
+	// Always confirm the port against the live server; a config file can be
+	// edited after the server was started.
+	if status.Port == "" || !IsPortListening(status.Port) {
+		if detected := getCurrentPort(); detected != "" {
+			status.Port = detected
 		}
 	}
 
@@ -83,93 +85,260 @@ func GetMariaDBStatus() MariaDBStatus {
 	return status
 }
 
-// IsMariaDBRunning checks if MariaDB/MySQL is running
-func IsMariaDBRunning() bool {
-	processName := AppConfig.ProcessNames[runtime.GOOS]
-	if processName == "" {
-		processName = "mysqld"
+// IsMariaDBRunningE reports whether a server process exists.
+//
+// A non-nil error means the lookup itself failed and the state is unknown.
+// Callers that are about to start or stop a server must use this form: the
+// boolean-only helper reports a failed lookup as "not running", which once let
+// DBSwitcher start a second server on top of a live one.
+func IsMariaDBRunningE() (bool, error) {
+	procs, err := FindServerProcesses()
+	if err != nil {
+		return false, err
 	}
-	
-	_, _, found := FindProcessWithCmdLine(processName)
-	return found
+	return len(procs) > 0, nil
 }
 
-// FindProcessWithCmdLine finds a process by name and returns its PID and command line
-func FindProcessWithCmdLine(processName string) (int, string, bool) {
+// IsMariaDBRunning is the best-effort form of IsMariaDBRunningE, for status
+// displays where an unknown state is acceptable.
+func IsMariaDBRunning() bool {
+	running, err := IsMariaDBRunningE()
+	if err != nil {
+		AppLogger.Warn("Process detection failed, assuming MariaDB is not running: %v", err)
+		return false
+	}
+	return running
+}
+
+// FindServerProcess returns the first running server process, if any.
+func FindServerProcess() (ProcessInfo, bool) {
+	procs, err := FindServerProcesses()
+	if err != nil {
+		AppLogger.Warn("Process detection failed: %v", err)
+		return ProcessInfo{}, false
+	}
+	if len(procs) == 0 {
+		return ProcessInfo{}, false
+	}
+	return procs[0], true
+}
+
+// FindServerProcesses returns every running MariaDB/MySQL server process.
+func FindServerProcesses() ([]ProcessInfo, error) {
 	switch runtime.GOOS {
 	case "windows":
-		return findWindowsProcessWithCmdLine(processName)
+		return findWindowsProcesses(serverProcessNames())
 	default:
-		return findUnixProcessWithCmdLine(processName)
+		return findUnixProcesses(serverProcessNames())
 	}
 }
 
-func findWindowsProcessWithCmdLine(processName string) (int, string, bool) {
-	// Try WMI query for command line
-	cmd := exec.Command("powershell", "-NoProfile", "-Command",
-		fmt.Sprintf(`Get-WmiObject Win32_Process -Filter "Name='%s'" | Select-Object ProcessId,CommandLine | ConvertTo-Json`, processName))
-	
-	output, err := cmd.Output()
-	if err != nil {
-		return 0, "", false
-	}
+// serverProcessNames lists the executable names a server may run under.
+// MariaDB 11 ships both mysqld and mariadbd, so neither name alone is enough.
+func serverProcessNames() []string {
+	names := []string{}
 
-	outputStr := string(output)
-	if strings.Contains(outputStr, "ProcessId") {
-		// Parse the JSON-like output to extract PID and CommandLine
-		lines := strings.Split(outputStr, "\n")
-		for _, line := range lines {
-			if strings.Contains(line, "ProcessId") {
-				// Extract PID
-				pidStart := strings.Index(line, ":") + 1
-				pidEnd := strings.IndexAny(line[pidStart:], ",}")
-				if pidEnd == -1 {
-					pidEnd = len(line) - pidStart
-				}
-				pidStr := strings.TrimSpace(line[pidStart:pidStart+pidEnd])
-				pid, _ := strconv.Atoi(pidStr)
-				
-				// Get command line from next lines
-				cmdLine := ""
-				for _, cmdLineLine := range lines {
-					if strings.Contains(cmdLineLine, "CommandLine") {
-						cmdStart := strings.Index(cmdLineLine, ":") + 1
-						cmdLine = strings.Trim(cmdLineLine[cmdStart:], " \t\r\n\"")
-						break
-					}
-				}
-				
-				if pid > 0 {
-					return pid, cmdLine, true
-				}
+	appendName := func(name string) {
+		if name == "" {
+			return
+		}
+		for _, existing := range names {
+			if strings.EqualFold(existing, name) {
+				return
 			}
 		}
+		names = append(names, name)
 	}
 
-	return 0, "", false
+	appendName(AppConfig.ProcessNames[runtime.GOOS])
+	appendName(GetExecutableName("mysqld"))
+	appendName(GetExecutableName("mariadbd"))
+
+	return names
 }
 
-func findUnixProcessWithCmdLine(processName string) (int, string, bool) {
-	// Use ps command to find the process
-	cmd := exec.Command("ps", "aux")
-	output, err := cmd.Output()
-	if err != nil {
-		return 0, "", false
+func findWindowsProcesses(names []string) ([]ProcessInfo, error) {
+	filters := make([]string, 0, len(names))
+	for _, name := range names {
+		filters = append(filters, fmt.Sprintf("Name='%s'", name))
+	}
+	query := fmt.Sprintf(`Win32_Process -Filter "%s" | Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress`,
+		strings.Join(filters, " or "))
+
+	// Get-CimInstance is the supported cmdlet; Get-WmiObject is kept as a
+	// fallback for older PowerShell hosts where CIM is unavailable.
+	var lastErr error
+	for _, cmdlet := range []string{"Get-CimInstance", "Get-WmiObject"} {
+		output, err := runPowerShell(cmdlet + " " + query)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+
+		procs, err := parseProcessJSON(output)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		return procs, nil
 	}
 
-	lines := strings.Split(string(output), "\n")
-	for _, line := range lines {
-		if strings.Contains(line, processName) && !strings.Contains(line, "grep") {
-			fields := strings.Fields(line)
-			if len(fields) >= 11 {
-				pid, _ := strconv.Atoi(fields[1])
-				cmdLine := strings.Join(fields[10:], " ")
-				return pid, cmdLine, true
-			}
+	return nil, fmt.Errorf("could not query running processes: %v", lastErr)
+}
+
+// runPowerShell runs a PowerShell snippet and treats anything on stderr as a
+// failure, so a broken WMI query can never be read as an empty process list.
+func runPowerShell(script string) (string, error) {
+	cmd := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command", script)
+
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		detail := strings.TrimSpace(stderr.String())
+		if detail == "" {
+			detail = err.Error()
+		}
+		return "", fmt.Errorf("powershell: %s", detail)
+	}
+
+	if detail := strings.TrimSpace(stderr.String()); detail != "" {
+		return "", fmt.Errorf("powershell: %s", detail)
+	}
+
+	return stdout.String(), nil
+}
+
+// parseProcessJSON decodes ConvertTo-Json output, which is an object for a
+// single match, an array for several, and empty for none.
+func parseProcessJSON(output string) ([]ProcessInfo, error) {
+	trimmed := strings.TrimSpace(output)
+	if trimmed == "" {
+		return nil, nil
+	}
+
+	type jsonProcess struct {
+		ProcessID   int    `json:"ProcessId"`
+		CommandLine string `json:"CommandLine"`
+	}
+
+	var entries []jsonProcess
+	if strings.HasPrefix(trimmed, "[") {
+		if err := json.Unmarshal([]byte(trimmed), &entries); err != nil {
+			return nil, fmt.Errorf("cannot parse process list: %v", err)
+		}
+	} else {
+		var single jsonProcess
+		if err := json.Unmarshal([]byte(trimmed), &single); err != nil {
+			return nil, fmt.Errorf("cannot parse process entry: %v", err)
+		}
+		entries = append(entries, single)
+	}
+
+	procs := make([]ProcessInfo, 0, len(entries))
+	for _, entry := range entries {
+		if entry.ProcessID > 0 {
+			procs = append(procs, ProcessInfo{PID: entry.ProcessID, CommandLine: entry.CommandLine})
 		}
 	}
+	return procs, nil
+}
 
-	return 0, "", false
+func findUnixProcesses(names []string) ([]ProcessInfo, error) {
+	cmd := exec.Command("ps", "-eo", "pid=,args=")
+	output, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("ps failed: %v", err)
+	}
+
+	var procs []ProcessInfo
+	for _, line := range strings.Split(string(output), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+
+		pid, err := strconv.Atoi(fields[0])
+		if err != nil {
+			continue
+		}
+
+		cmdLine := strings.Join(fields[1:], " ")
+		if !matchesProcessName(cmdLine, names) {
+			continue
+		}
+
+		procs = append(procs, ProcessInfo{PID: pid, CommandLine: cmdLine})
+	}
+
+	return procs, nil
+}
+
+// matchesProcessName compares the executable of a command line against the
+// known server names, so unrelated processes that merely mention mysqld (a
+// client, an editor, this program) are not counted as a running server.
+func matchesProcessName(cmdLine string, names []string) bool {
+	executable := strings.TrimSpace(cmdLine)
+
+	// A quoted executable may contain spaces ("C:\Program Files\...\mysqld.exe").
+	if strings.HasPrefix(executable, `"`) {
+		if end := strings.Index(executable[1:], `"`); end != -1 {
+			executable = executable[1 : end+1]
+		}
+	} else if idx := strings.IndexAny(executable, " \t"); idx != -1 {
+		executable = executable[:idx]
+	}
+
+	executable = filepath.Base(strings.Trim(executable, `"'`))
+
+	for _, name := range names {
+		if strings.EqualFold(executable, name) {
+			return true
+		}
+	}
+	return false
+}
+
+// ShutdownTimeout returns how long to wait for a server to stop. Flushing a
+// large InnoDB buffer pool routinely takes longer than the configured process
+// timeout, so a one minute floor applies.
+func ShutdownTimeout() time.Duration {
+	seconds := AppConfig.ProcessTimeoutSecs
+	if seconds < 60 {
+		seconds = 60
+	}
+	return time.Duration(seconds) * time.Second
+}
+
+// WaitForMariaDBStopped blocks until no server process remains and port is
+// free again. The old code assumed a fixed three second sleep was enough,
+// which it is not for a multi-gigabyte buffer pool.
+func WaitForMariaDBStopped(port string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	lastState := "unknown"
+
+	for {
+		running, err := IsMariaDBRunningE()
+		switch {
+		case err != nil:
+			lastState = fmt.Sprintf("process state unknown: %v", err)
+		case running:
+			lastState = "server process is still running"
+		case port != "" && !IsPortAvailable(port):
+			lastState = fmt.Sprintf("port %s is still in use", port)
+		default:
+			AppLogger.Log("MariaDB has stopped and port %s is free", port)
+			return nil
+		}
+
+		if time.Now().After(deadline) {
+			return fmt.Errorf("timed out after %s waiting for MariaDB to stop (%s)", timeout, lastState)
+		}
+
+		AppLogger.Debug("Waiting for shutdown: %s", lastState)
+		time.Sleep(1 * time.Second)
+	}
 }
 
 func extractConfigFromCmdLine(cmdLine string) string {
@@ -230,15 +399,11 @@ func getCurrentPort() string {
 
 // extractPortFromCmdLine attempts to extract port from command line arguments
 func extractPortFromCmdLine() string {
-	processName := AppConfig.ProcessNames[runtime.GOOS]
-	if processName == "" {
-		processName = "mysqld"
-	}
-
-	_, cmdLine, found := FindProcessWithCmdLine(processName)
+	proc, found := FindServerProcess()
 	if !found {
 		return ""
 	}
+	cmdLine := proc.CommandLine
 
 	// Look for --port= parameter
 	if idx := strings.Index(cmdLine, "--port="); idx != -1 {
@@ -265,28 +430,17 @@ func extractPortFromCmdLine() string {
 func queryDatabasePort() string {
 	// Try to connect with default credentials and query the port
 	creds := GetDefaultCredentials()
-	
-	mysqlPath := filepath.Join(AppConfig.MariaDBBin, "mysql")
-	if runtime.GOOS == "windows" {
-		mysqlPath += ".exe"
-	}
 
-	// Build command to query the port
-	args := []string{
-		"-h", creds.Host,
-		"-u", creds.Username,
+	cmd, cleanup, err := clientCommand(nil, creds,
 		"-e", "SHOW VARIABLES LIKE 'port';",
 		"--silent",
-		"--skip-column-names",
+		"--skip-column-names")
+	if err != nil {
+		AppLogger.Debug("Cannot query port from server: %v", err)
+		return ""
 	}
+	defer cleanup()
 
-	// Add password if provided
-	if creds.Password != "" {
-		args = append([]string{fmt.Sprintf("-p%s", creds.Password)}, args[3:]...)
-		args = append([]string{args[0], args[1], args[2]}, args[3:]...)
-	}
-
-	cmd := exec.Command(mysqlPath, args...)
 	output, err := cmd.Output()
 	if err != nil {
 		return ""
@@ -320,17 +474,12 @@ func getPortFromNetstat() string {
 		return ""
 	}
 
-	processName := AppConfig.ProcessNames[runtime.GOOS]
-	if processName == "" {
-		processName = "mysqld"
-	}
-
 	// Get the PID of MariaDB process
-	pid, _, found := FindProcessWithCmdLine(processName)
+	proc, found := FindServerProcess()
 	if !found {
 		return ""
 	}
-	pidStr := strconv.Itoa(pid)
+	pidStr := strconv.Itoa(proc.PID)
 
 	// Parse netstat output to find ports used by this PID
 	lines := strings.Split(string(output), "\n")
@@ -421,8 +570,15 @@ func StartMariaDBWithConfig(configFile string) error {
 	AppLogger.Log("STARTING MARIADB")
 	AppLogger.Log("========================================")
 	
-	// Check if MariaDB is already running
-	if IsMariaDBRunning() {
+	// Check if MariaDB is already running. A failed lookup aborts the start:
+	// launching on top of a live server corrupts nothing but does leave the
+	// user with a confusing "process not found" after the port bind fails.
+	running, err := IsMariaDBRunningE()
+	if err != nil {
+		AppLogger.Error(" Cannot determine whether MariaDB is running: %v", err)
+		return fmt.Errorf("cannot determine whether MariaDB is running: %v", err)
+	}
+	if running {
 		AppLogger.Log("MariaDB is already running")
 		return fmt.Errorf("MariaDB is already running - please stop it first")
 	}
@@ -527,16 +683,21 @@ func StartMariaDBWithConfig(configFile string) error {
 
 	// Check if MySQL/MariaDB is still running - no force stop
 	AppLogger.Log("Checking if all MySQL/MariaDB processes are stopped...")
-	if IsMariaDBRunning() {
+	running, err = IsMariaDBRunningE()
+	if err != nil {
+		return fmt.Errorf("cannot determine whether MariaDB is running: %v", err)
+	}
+	if running {
 		return fmt.Errorf("MySQL/MariaDB is still running - please stop it gracefully with credentials before starting a new instance")
 	}
-	
+
 	// Double-check the port is free
 	if !IsPortAvailable(configData.Port) {
 		AppLogger.Log("Port %s is still in use", configData.Port)
+		FindProcessUsingPort(configData.Port)
 		return fmt.Errorf("cannot start - port %s is occupied by another process", configData.Port)
 	}
-	
+
 	AppLogger.Log("Port %s is confirmed available", configData.Port)
 
 	// First, try to validate the config file syntax
@@ -556,12 +717,14 @@ func StartMariaDBWithConfig(configFile string) error {
 	}
 	
 	cmd := exec.Command(mysqldPath, args...)
-	
-	// Capture both stdout and stderr
-	var stdout, stderr bytes.Buffer
+
+	// Capture both stdout and stderr. The buffers are read below while the
+	// copy goroutines started by os/exec may still be writing, so they have to
+	// be synchronised.
+	var stdout, stderr syncBuffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
-	
+
 	// Set working directory to bin directory
 	cmd.Dir = AppConfig.MariaDBBin
 	
@@ -616,7 +779,7 @@ func StartMariaDBWithConfig(configFile string) error {
 		AppLogger.Log("Waiting for MariaDB to be ready... (%d/%d)", i+1, maxRetries)
 		time.Sleep(1 * time.Second)
 	}
-	
+
 	// Final verification
 	if !IsMariaDBRunning() {
 		stdoutStr := stdout.String()
@@ -627,6 +790,16 @@ func StartMariaDBWithConfig(configFile string) error {
 		}
 		if stderrStr != "" {
 			AppLogger.Log("Final stderr: %s", stderrStr)
+		}
+
+		// Report why the server gave up instead of the unhelpful
+		// "process not found".
+		serverOutput := stderrStr
+		if serverOutput == "" {
+			serverOutput = stdoutStr
+		}
+		if serverOutput != "" {
+			return fmt.Errorf("MariaDB failed to start: %s", ParseMariaDBError(serverOutput))
 		}
 		return fmt.Errorf("MariaDB failed to start - process not found. Check logs for details")
 	}

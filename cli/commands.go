@@ -106,24 +106,36 @@ func (c *CLI) Switch(configName string) error {
 	}
 	
 	// Check if MariaDB is currently running
-	if core.IsMariaDBRunning() {
-		fmt.Println("MariaDB is currently running. Stopping it first...")
-		
-		if err := c.Stop(); err != nil {
+	running, err := core.IsMariaDBRunningE()
+	if err != nil {
+		return fmt.Errorf("cannot determine whether MariaDB is running: %v", err)
+	}
+
+	if running {
+		status := core.GetMariaDBStatus()
+		if status.ConfigName != "" {
+			fmt.Printf("MariaDB is currently running with '%s'. Stopping it first...\n", status.ConfigName)
+		} else {
+			fmt.Println("MariaDB is currently running. Stopping it first...")
+		}
+
+		if err := c.stopRunningInstance(); err != nil {
 			return fmt.Errorf("failed to stop current MariaDB instance: %v", err)
 		}
-		
+
+		// Wait for the port the new instance needs, not just for the process:
+		// the old server releases its port a moment after it exits.
 		fmt.Println("Waiting for shutdown to complete...")
-		// Brief wait to ensure complete shutdown
 		core.AppLogger.Log("Waiting for complete shutdown before switching...")
-		// Add a simple wait here
+		if err := core.WaitForMariaDBStopped(targetConfig.Port, core.ShutdownTimeout()); err != nil {
+			return err
+		}
 	}
-	
+
 	// Start with new configuration
 	fmt.Printf("Starting MariaDB with %s configuration...\n", targetConfig.Name)
-	
-	err := core.StartMariaDBWithConfig(targetConfig.Path)
-	if err != nil {
+
+	if err := core.StartMariaDBWithConfig(targetConfig.Path); err != nil {
 		return fmt.Errorf("failed to start MariaDB: %v", err)
 	}
 	
@@ -156,15 +168,21 @@ func (c *CLI) Start(configName string) error {
 	}
 	
 	// Check if already running
-	if core.IsMariaDBRunning() {
+	running, err := core.IsMariaDBRunningE()
+	if err != nil {
+		return fmt.Errorf("cannot determine whether MariaDB is running: %v", err)
+	}
+	if running {
 		status := core.GetMariaDBStatus()
+		if status.ConfigName == "" {
+			return fmt.Errorf("MariaDB is already running (PID %d)", status.ProcessID)
+		}
 		return fmt.Errorf("MariaDB is already running with configuration '%s'", status.ConfigName)
 	}
-	
+
 	fmt.Printf("Starting MariaDB with %s configuration...\n", targetConfig.Name)
-	
-	err := core.StartMariaDBWithConfig(targetConfig.Path)
-	if err != nil {
+
+	if err := core.StartMariaDBWithConfig(targetConfig.Path); err != nil {
 		return fmt.Errorf("failed to start MariaDB: %v", err)
 	}
 	
@@ -175,101 +193,178 @@ func (c *CLI) Start(configName string) error {
 	return nil
 }
 
+// maxCredentialAttempts limits how often the user is re-prompted after the
+// server rejects the credentials.
+const maxCredentialAttempts = 3
+
 // Stop stops the running MariaDB instance
 func (c *CLI) Stop() error {
-	if !core.IsMariaDBRunning() {
+	running, err := core.IsMariaDBRunningE()
+	if err != nil {
+		return fmt.Errorf("cannot determine whether MariaDB is running: %v", err)
+	}
+
+	if !running {
 		fmt.Println("MariaDB is not currently running.")
 		return nil
 	}
-	
-	fmt.Println("Stopping MariaDB...")
-	
-	// Try to get credentials for graceful shutdown
-	creds, err := c.promptForCredentials()
-	if err != nil {
-		return fmt.Errorf("failed to get credentials: %v", err)
-	}
-	
-	// Attempt graceful shutdown
-	err = core.StopMySQLWithCredentials(creds)
-	if err != nil {
-		return fmt.Errorf("failed to stop MariaDB gracefully: %v", err)
-	}
-	
-	fmt.Println("✓ MariaDB stopped successfully")
-	return nil
+
+	return c.stopRunningInstance()
 }
 
-// promptForCredentials prompts the user for MySQL credentials
-func (c *CLI) promptForCredentials() (core.MySQLCredentials, error) {
+// stopRunningInstance shuts the server down, re-prompting when the stored
+// credentials are rejected instead of failing the whole command. A stale
+// keyring entry used to abort every switch with "shutdown failed: exit status 1".
+func (c *CLI) stopRunningInstance() error {
+	fmt.Println("Stopping MariaDB...")
+
+	// Target the instance that is actually running rather than whatever port
+	// happens to be stored with the credentials.
+	status := core.GetMariaDBStatus()
+	allowSaved := core.SavedCredentials != nil
+
+	for attempt := 1; attempt <= maxCredentialAttempts; attempt++ {
+		creds, usedSaved, err := c.promptForCredentials(allowSaved, status.Port)
+		if err != nil {
+			return fmt.Errorf("failed to get credentials: %v", err)
+		}
+
+		err = core.StopMySQLWithCredentials(creds)
+		if err == nil {
+			fmt.Println("✓ MariaDB stopped successfully")
+			if !usedSaved {
+				// Only ever store credentials that have just worked.
+				c.offerToSaveCredentials(creds)
+			}
+			return nil
+		}
+
+		if !core.IsCredentialError(err) {
+			return fmt.Errorf("failed to stop MariaDB gracefully: %v", err)
+		}
+
+		fmt.Printf("\nMariaDB rejected those credentials:\n  %s\n", core.ClientOutput(err))
+		if usedSaved {
+			fmt.Println("The credentials saved in your keyring are no longer valid.")
+		}
+		if attempt < maxCredentialAttempts {
+			fmt.Println("Please enter the current MySQL admin credentials.")
+		}
+
+		// Never retry with the entry that was just rejected.
+		allowSaved = false
+	}
+
+	return fmt.Errorf("failed to stop MariaDB: credentials rejected %d times", maxCredentialAttempts)
+}
+
+// promptForCredentials prompts the user for MySQL credentials. It reports
+// whether the saved credentials were reused, so only freshly entered ones are
+// offered for saving. detectedPort, when known, is the port of the running
+// server and is preferred over the stored one.
+func (c *CLI) promptForCredentials(allowSaved bool, detectedPort string) (core.MySQLCredentials, bool, error) {
 	reader := bufio.NewReader(os.Stdin)
-	
+
 	// Try to use saved credentials first
-	if core.SavedCredentials != nil {
-		fmt.Printf("Use saved credentials (user: %s, host: %s)? [Y/n]: ", 
+	if allowSaved && core.SavedCredentials != nil {
+		fmt.Printf("Use saved credentials (user: %s, host: %s)? [Y/n]: ",
 			core.SavedCredentials.Username, core.SavedCredentials.Host)
-		
+
 		response, _ := reader.ReadString('\n')
-		response = strings.TrimSpace(response)
-		
-		if response == "" || strings.ToLower(response) == "y" || strings.ToLower(response) == "yes" {
-			return *core.SavedCredentials, nil
+		response = strings.ToLower(strings.TrimSpace(response))
+
+		if response == "" || response == "y" || response == "yes" {
+			creds := *core.SavedCredentials
+			if detectedPort != "" && detectedPort != creds.Port {
+				fmt.Printf("Using detected port %s (saved credentials say %s).\n", detectedPort, creds.Port)
+				creds.Port = detectedPort
+			}
+			return creds, true, nil
 		}
 	}
-	
+
 	// Prompt for new credentials
 	creds := core.MySQLCredentials{}
-	
-	fmt.Print("MySQL Username [root]: ")
+
+	defaultUsername := "root"
+	defaultHost := "localhost"
+	defaultPort := "3306"
+	if core.SavedCredentials != nil {
+		if core.SavedCredentials.Username != "" {
+			defaultUsername = core.SavedCredentials.Username
+		}
+		if core.SavedCredentials.Host != "" {
+			defaultHost = core.SavedCredentials.Host
+		}
+	}
+	if detectedPort != "" {
+		defaultPort = detectedPort
+	}
+
+	fmt.Printf("MySQL Username [%s]: ", defaultUsername)
 	username, _ := reader.ReadString('\n')
 	username = strings.TrimSpace(username)
 	if username == "" {
-		username = "root"
+		username = defaultUsername
 	}
 	creds.Username = username
-	
-	fmt.Print("MySQL Host [localhost]: ")
+
+	fmt.Printf("MySQL Host [%s]: ", defaultHost)
 	host, _ := reader.ReadString('\n')
 	host = strings.TrimSpace(host)
 	if host == "" {
-		host = "localhost"
+		host = defaultHost
 	}
 	creds.Host = host
-	
-	fmt.Print("MySQL Port [3306]: ")
+
+	fmt.Printf("MySQL Port [%s]: ", defaultPort)
 	port, _ := reader.ReadString('\n')
 	port = strings.TrimSpace(port)
 	if port == "" {
-		port = "3306"
+		port = defaultPort
 	}
 	creds.Port = port
-	
+
 	fmt.Print("MySQL Password (leave empty if none): ")
-	
+
 	// Hide password input
 	passwordBytes, err := term.ReadPassword(int(syscall.Stdin))
 	if err != nil {
-		return creds, fmt.Errorf("failed to read password: %v", err)
+		return creds, false, fmt.Errorf("failed to read password: %v", err)
 	}
 	fmt.Println() // New line after password input
-	
+
 	creds.Password = string(passwordBytes)
-	
-	// Ask if user wants to save credentials
-	fmt.Print("Save credentials for future use? [y/N]: ")
-	response, _ := reader.ReadString('\n')
-	response = strings.TrimSpace(response)
-	
-	if strings.ToLower(response) == "y" || strings.ToLower(response) == "yes" {
-		if err := core.SaveCredentialsToKeyring(creds); err != nil {
-			fmt.Printf("Warning: Failed to save credentials: %v\n", err)
-		} else {
-			core.SavedCredentials = &creds
-			fmt.Println("Credentials saved securely.")
-		}
+
+	return creds, false, nil
+}
+
+// offerToSaveCredentials stores credentials once they are known to work. The
+// old flow saved them before the first connection attempt, which is how a
+// wrong password ended up in the keyring and broke every later switch.
+func (c *CLI) offerToSaveCredentials(creds core.MySQLCredentials) {
+	reader := bufio.NewReader(os.Stdin)
+
+	prompt := "Save these credentials for future use? [Y/n]: "
+	if core.SavedCredentials != nil {
+		prompt = "Update the saved credentials with these? [Y/n]: "
 	}
-	
-	return creds, nil
+	fmt.Print(prompt)
+
+	response, _ := reader.ReadString('\n')
+	response = strings.ToLower(strings.TrimSpace(response))
+	if response != "" && response != "y" && response != "yes" {
+		return
+	}
+
+	if err := core.SaveCredentialsToKeyring(creds); err != nil {
+		fmt.Printf("Warning: Failed to save credentials: %v\n", err)
+		return
+	}
+
+	saved := creds
+	core.SavedCredentials = &saved
+	fmt.Println("Credentials saved securely.")
 }
 
 // ShowHelp displays CLI help information

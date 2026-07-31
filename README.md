@@ -27,7 +27,9 @@ A powerful, cross-platform tool for managing multiple MariaDB/MySQL configuratio
 
 ### Security & Credentials
 
-- **Secure Storage**: Credentials stored safely using system keyring
+- **Secure Storage**: Credentials stored safely using system keyring, and only after they are known to work
+- **Automatic Re-prompt**: If the stored password is rejected, you are asked for the current one and offered to update the keyring entry
+- **No Password on the Command Line**: Credentials reach the client through a private options file, never through argv or the log
 - **Flexible Authentication**: Support for password and passwordless connections
 - **Session Management**: Remember credentials for the current session
 - **Connection Testing**: Built-in connection validation

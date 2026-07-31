@@ -4,9 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"os/exec"
-	"path/filepath"
-	"runtime"
 	"strings"
 	"time"
 
@@ -75,36 +72,27 @@ func DeleteCredentialsFromKeyring() error {
 
 // TestMySQLConnection tests a MySQL connection with provided credentials
 func TestMySQLConnection(creds MySQLCredentials) error {
-	mysqlPath := filepath.Join(AppConfig.MariaDBBin, "mysql")
-	if runtime.GOOS == "windows" {
-		mysqlPath += ".exe"
+	timeout := AppConfig.ConnectionTimeoutSecs
+	if timeout <= 0 {
+		timeout = 5
 	}
-	
-	// Build command with credentials
-	args := []string{
-		"-h", creds.Host,
-		"-P", creds.Port,
-		"-u", creds.Username,
-	}
-	
-	// Add password if provided
-	if creds.Password != "" {
-		args = append(args, fmt.Sprintf("-p%s", creds.Password))
-	}
-	
-	// Add test query
-	args = append(args, "-e", "SELECT 1")
-	
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(AppConfig.ConnectionTimeoutSecs)*time.Second)
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeout)*time.Second)
 	defer cancel()
-	
-	cmd := exec.CommandContext(ctx, mysqlPath, args...)
-	output, err := cmd.CombinedOutput()
-	
+
+	cmd, cleanup, err := clientCommand(ctx, creds, "-e", "SELECT 1")
 	if err != nil {
-		return fmt.Errorf("connection failed: %v\nOutput: %s", err, string(output))
+		return err
 	}
-	
+	defer cleanup()
+
+	output, err := cmd.CombinedOutput()
+
+	if err != nil {
+		// Keep the server's own message so IsCredentialError can classify it.
+		return &ClientError{Output: string(output), Err: err}
+	}
+
 	return nil
 }
 
@@ -145,18 +133,26 @@ func SetCredentialsDefaults(creds *MySQLCredentials) {
 	}
 }
 
-// IsCredentialError checks if an error is related to credential authentication
+// IsCredentialError checks if an error is related to credential authentication.
+//
+// This only works because ClientError carries the client's output: the old
+// errors collapsed to "shutdown failed: exit status 1", which matched nothing
+// here, so the GUI never re-prompted and the CLI simply gave up.
 func IsCredentialError(err error) bool {
 	if err == nil {
 		return false
 	}
-	
+
 	errStr := strings.ToLower(err.Error())
-	// Check for common MySQL authentication errors
-	return strings.Contains(errStr, "access denied") ||
-		   strings.Contains(errStr, "authentication") ||
-		   strings.Contains(errStr, "password") ||
-		   strings.Contains(errStr, "user") ||
-		   strings.Contains(errStr, "login") ||
-		   strings.Contains(errStr, "credentials")
+	for _, marker := range []string{
+		"access denied",
+		"using password",
+		"authentication",
+		"password expired",
+	} {
+		if strings.Contains(errStr, marker) {
+			return true
+		}
+	}
+	return false
 }

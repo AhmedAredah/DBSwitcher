@@ -11,12 +11,14 @@ var SystrayRunning bool
 // StopMariaDBServiceWithUI stops MariaDB with UI credential handling
 func StopMariaDBServiceWithUI(window fyne.Window, callback func(error)) {
 	go func() {
-		// Try to use saved credentials first
-		creds := core.GetDefaultCredentials()
+		// Try to use saved credentials first, aimed at the port the server is
+		// really listening on.
+		creds := core.GetCredentialsForRunningInstance()
 		err := core.StopMySQLWithCredentials(creds)
-		
+
 		// If credentials failed, show credential dialog
 		if err != nil && core.IsCredentialError(err) {
+			core.AppLogger.Log("Saved credentials were rejected (%s), asking the user", core.ClientOutput(err))
 			// Run credential dialog on main UI thread
 			fyne.Do(func() {
 				ShowCredentialsDialog(window, func(newCreds core.MySQLCredentials) {
