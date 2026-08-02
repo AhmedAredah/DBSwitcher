@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"strings"
 
 	"mariadb-monitor/cli"
 	"mariadb-monitor/core"
@@ -15,6 +16,13 @@ var (
 	BuildDate   = "unknown"                                  // Set via -ldflags at build time  
 	Description = "MariaDB Configuration Manager"
 )
+
+// displayVersion returns the version with exactly one leading "v". The build
+// passes the git tag, which already carries one, so a plain "v%s" printed
+// "vv0.0.1".
+func displayVersion() string {
+	return "v" + strings.TrimPrefix(Version, "v")
+}
 
 func main() {
 	// Initialize core subsystems
@@ -123,7 +131,7 @@ func main() {
 		cli.ShowHelp()
 
 	case "version", "--version", "-v":
-		fmt.Printf("DBSwitcher v%s - %s\n", Version, Description)
+		fmt.Printf("DBSwitcher %s - %s\n", displayVersion(), Description)
 		if BuildDate != "unknown" {
 			fmt.Printf("Build Date: %s\n", BuildDate)
 		}
@@ -144,7 +152,7 @@ func initializeApplication() error {
 	core.InitCredentials()
 	
 	// Log application startup
-	core.AppLogger.Log("DBSwitcher v%s started", Version)
+	core.AppLogger.Log("DBSwitcher %s started", displayVersion())
 	core.AppLogger.Log("Configuration directory: %s", core.AppConfig.ConfigPath)
 	core.AppLogger.Log("MariaDB binary directory: %s", core.AppConfig.MariaDBBin)
 	
