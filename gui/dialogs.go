@@ -18,46 +18,62 @@ import (
 	"mariadb-monitor/core"
 )
 
-// ShowCredentialsDialog shows the MySQL credentials dialog
+// ShowCredentialsDialog shows the MySQL credentials dialog. Credentials belong
+// to the running configuration, because every configuration has its own data
+// directory and therefore its own accounts.
 func ShowCredentialsDialog(parent fyne.Window, onSuccess func(core.MySQLCredentials), onCancel func()) {
+	configName := core.CurrentStatus.ConfigName
+	prefill, _, _ := core.LoadCredentialsForConfig(configName)
+	if prefill == nil {
+		prefill = core.SavedCredentials
+	}
+
 	// Create form fields
 	usernameEntry := widget.NewEntry()
 	usernameEntry.SetPlaceHolder("root")
-	if core.SavedCredentials != nil && core.SavedCredentials.Username != "" {
-		usernameEntry.SetText(core.SavedCredentials.Username)
+	if prefill != nil && prefill.Username != "" {
+		usernameEntry.SetText(prefill.Username)
 	} else {
 		usernameEntry.SetText("root") // Default suggestion
 	}
-	
+
 	passwordEntry := widget.NewPasswordEntry()
 	passwordEntry.SetPlaceHolder("Enter password (leave empty if none)")
-	if core.SavedCredentials != nil {
-		passwordEntry.SetText(core.SavedCredentials.Password)
+	if prefill != nil {
+		passwordEntry.SetText(prefill.Password)
 	}
-	
+
 	hostEntry := widget.NewEntry()
 	hostEntry.SetPlaceHolder("localhost")
-	if core.SavedCredentials != nil && core.SavedCredentials.Host != "" {
-		hostEntry.SetText(core.SavedCredentials.Host)
+	if prefill != nil && prefill.Host != "" {
+		hostEntry.SetText(prefill.Host)
 	} else {
 		hostEntry.SetText("localhost")
 	}
-	
+
 	portEntry := widget.NewEntry()
 	portEntry.SetPlaceHolder("3306")
-	if core.SavedCredentials != nil && core.SavedCredentials.Port != "" {
-		portEntry.SetText(core.SavedCredentials.Port)
-	} else {
+	switch {
+	case core.CurrentStatus.IsRunning && core.CurrentStatus.Port != "":
+		// The running server settles the port, whatever was stored.
+		portEntry.SetText(core.CurrentStatus.Port)
+	case prefill != nil && prefill.Port != "":
+		portEntry.SetText(prefill.Port)
+	default:
 		portEntry.SetText("3306")
 	}
-	
+
 	// Remember credentials checkbox options
 	rememberSessionCheck := widget.NewCheck("Remember for this session", nil)
 	rememberSessionCheck.SetChecked(true)
-	
-	rememberPermanentCheck := widget.NewCheck("Save credentials permanently (secure storage)", nil)
-	rememberPermanentCheck.SetChecked(core.SavedCredentials != nil)
-	
+
+	saveLabel := "Save credentials permanently (secure storage)"
+	if configName != "" {
+		saveLabel = fmt.Sprintf("Save credentials for '%s' permanently (secure storage)", configName)
+	}
+	rememberPermanentCheck := widget.NewCheck(saveLabel, nil)
+	rememberPermanentCheck.SetChecked(prefill != nil)
+
 	// Create form
 	items := []*widget.FormItem{
 		widget.NewFormItem("Username", usernameEntry),
@@ -67,9 +83,14 @@ func ShowCredentialsDialog(parent fyne.Window, onSuccess func(core.MySQLCredenti
 		widget.NewFormItem("", rememberSessionCheck),
 		widget.NewFormItem("", rememberPermanentCheck),
 	}
-	
+
+	title := "MySQL Admin Credentials"
+	if configName != "" {
+		title = fmt.Sprintf("MySQL Admin Credentials - %s", configName)
+	}
+
 	// Create dialog with custom buttons
-	d := dialog.NewForm("MySQL Admin Credentials", "Connect", "Cancel", items, 
+	d := dialog.NewForm(title, "Connect", "Cancel", items,
 		func(confirmed bool) {
 			if confirmed {
 				creds := core.MySQLCredentials{
@@ -95,17 +116,18 @@ func ShowCredentialsDialog(parent fyne.Window, onSuccess func(core.MySQLCredenti
 					core.SavedCredentials = &creds
 				}
 				
-				// Save credentials permanently if requested
+				// Save credentials permanently if requested, under the
+				// configuration they belong to.
 				if rememberPermanentCheck.Checked {
-					if err := core.SaveCredentialsToKeyring(creds); err != nil {
+					if err := core.SaveCredentialsForConfig(configName, creds); err != nil {
 						core.AppLogger.Log("Failed to save credentials to keyring: %v", err)
 						dialog.ShowError(fmt.Errorf("Failed to save credentials: %v", err), parent)
 					} else {
 						core.SavedCredentials = &creds
 					}
-				} else if !rememberPermanentCheck.Checked && core.SavedCredentials != nil {
-					// If unchecked, remove saved credentials
-					if err := core.DeleteCredentialsFromKeyring(); err != nil {
+				} else if prefill != nil {
+					// If unchecked, remove what was stored for this configuration
+					if err := core.DeleteCredentialsForConfig(configName); err != nil {
 						core.AppLogger.Log("Failed to delete credentials from keyring: %v", err)
 					}
 				}

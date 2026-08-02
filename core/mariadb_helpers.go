@@ -209,14 +209,17 @@ func StopMySQLWithCredentials(creds MySQLCredentials) error {
 	return nil
 }
 
-// GetCredentialsForRunningInstance returns the saved credentials aimed at the
-// server that is actually running, so a stale saved port cannot send the
-// shutdown somewhere else.
+// GetCredentialsForRunningInstance returns the credentials stored for the
+// configuration that is actually running, aimed at the port it is actually
+// listening on - neither the configuration nor the port can be taken from a
+// single shared entry.
 func GetCredentialsForRunningInstance() MySQLCredentials {
-	creds := GetDefaultCredentials()
+	status := GetMariaDBStatus()
+
+	creds := GetCredentialsForConfig(status.ConfigName)
 	SetCredentialsDefaults(&creds)
 
-	if status := GetMariaDBStatus(); status.IsRunning && status.Port != "" && status.Port != creds.Port {
+	if status.IsRunning && status.Port != "" && status.Port != creds.Port {
 		AppLogger.Log("Targeting detected port %s instead of saved port %s", status.Port, creds.Port)
 		creds.Port = status.Port
 	}

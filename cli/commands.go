@@ -221,10 +221,18 @@ func (c *CLI) stopRunningInstance() error {
 	// Target the instance that is actually running rather than whatever port
 	// happens to be stored with the credentials.
 	status := core.GetMariaDBStatus()
-	allowSaved := core.SavedCredentials != nil
+	configName := status.ConfigName
+
+	// Each configuration has its own data directory and therefore its own
+	// password for the same account.
+	saved, ownEntry, err := core.LoadCredentialsForConfig(configName)
+	if err != nil {
+		fmt.Printf("Warning: could not read stored credentials: %v\n", err)
+		saved = nil
+	}
 
 	for attempt := 1; attempt <= maxCredentialAttempts; attempt++ {
-		creds, usedSaved, err := c.promptForCredentials(allowSaved, status.Port)
+		creds, usedSaved, err := c.promptForCredentials(saved, configName, status.Port)
 		if err != nil {
 			return fmt.Errorf("failed to get credentials: %v", err)
 		}
@@ -232,9 +240,17 @@ func (c *CLI) stopRunningInstance() error {
 		err = core.StopMySQLWithCredentials(creds)
 		if err == nil {
 			fmt.Println("✓ MariaDB stopped successfully")
-			if !usedSaved {
+
+			if usedSaved {
+				// The shared entry turned out to be right for this
+				// configuration; file it under the configuration so the next
+				// switch does not depend on the fallback.
+				if core.RecordWorkingCredentials(configName, creds) {
+					fmt.Printf("Recorded these credentials for the '%s' configuration.\n", configName)
+				}
+			} else {
 				// Only ever store credentials that have just worked.
-				c.offerToSaveCredentials(creds)
+				c.offerToSaveCredentials(configName, creds)
 			}
 			return nil
 		}
@@ -245,36 +261,44 @@ func (c *CLI) stopRunningInstance() error {
 
 		fmt.Printf("\nMariaDB rejected those credentials:\n  %s\n", core.ClientOutput(err))
 		if usedSaved {
-			fmt.Println("The credentials saved in your keyring are no longer valid.")
+			if ownEntry {
+				fmt.Printf("The credentials stored for '%s' are no longer valid.\n", configName)
+			} else {
+				fmt.Printf("Those are the shared credentials; '%s' uses a different data directory and may have its own password.\n", configName)
+			}
 		}
 		if attempt < maxCredentialAttempts {
 			fmt.Println("Please enter the current MySQL admin credentials.")
 		}
 
 		// Never retry with the entry that was just rejected.
-		allowSaved = false
+		saved = nil
 	}
 
 	return fmt.Errorf("failed to stop MariaDB: credentials rejected %d times", maxCredentialAttempts)
 }
 
-// promptForCredentials prompts the user for MySQL credentials. It reports
-// whether the saved credentials were reused, so only freshly entered ones are
+// promptForCredentials prompts the user for MySQL credentials. saved is the
+// entry to offer first, or nil to prompt from scratch; the second result
+// reports whether it was reused, so only freshly entered credentials are
 // offered for saving. detectedPort, when known, is the port of the running
 // server and is preferred over the stored one.
-func (c *CLI) promptForCredentials(allowSaved bool, detectedPort string) (core.MySQLCredentials, bool, error) {
+func (c *CLI) promptForCredentials(saved *core.MySQLCredentials, configName, detectedPort string) (core.MySQLCredentials, bool, error) {
 	reader := bufio.NewReader(os.Stdin)
 
 	// Try to use saved credentials first
-	if allowSaved && core.SavedCredentials != nil {
-		fmt.Printf("Use saved credentials (user: %s, host: %s)? [Y/n]: ",
-			core.SavedCredentials.Username, core.SavedCredentials.Host)
+	if saved != nil {
+		scope := "saved credentials"
+		if configName != "" {
+			scope = fmt.Sprintf("saved credentials for '%s'", configName)
+		}
+		fmt.Printf("Use %s (user: %s, host: %s)? [Y/n]: ", scope, saved.Username, saved.Host)
 
 		response, _ := reader.ReadString('\n')
 		response = strings.ToLower(strings.TrimSpace(response))
 
 		if response == "" || response == "y" || response == "yes" {
-			creds := *core.SavedCredentials
+			creds := *saved
 			if detectedPort != "" && detectedPort != creds.Port {
 				fmt.Printf("Using detected port %s (saved credentials say %s).\n", detectedPort, creds.Port)
 				creds.Port = detectedPort
@@ -289,7 +313,14 @@ func (c *CLI) promptForCredentials(allowSaved bool, detectedPort string) (core.M
 	defaultUsername := "root"
 	defaultHost := "localhost"
 	defaultPort := "3306"
-	if core.SavedCredentials != nil {
+	if saved != nil {
+		if saved.Username != "" {
+			defaultUsername = saved.Username
+		}
+		if saved.Host != "" {
+			defaultHost = saved.Host
+		}
+	} else if core.SavedCredentials != nil {
 		if core.SavedCredentials.Username != "" {
 			defaultUsername = core.SavedCredentials.Username
 		}
@@ -339,15 +370,23 @@ func (c *CLI) promptForCredentials(allowSaved bool, detectedPort string) (core.M
 	return creds, false, nil
 }
 
-// offerToSaveCredentials stores credentials once they are known to work. The
-// old flow saved them before the first connection attempt, which is how a
+// offerToSaveCredentials stores credentials once they are known to work, under
+// the configuration they were proven against. The old flow saved them before
+// the first connection attempt and under a single shared key, which is how a
 // wrong password ended up in the keyring and broke every later switch.
-func (c *CLI) offerToSaveCredentials(creds core.MySQLCredentials) {
+func (c *CLI) offerToSaveCredentials(configName string, creds core.MySQLCredentials) {
 	reader := bufio.NewReader(os.Stdin)
 
-	prompt := "Save these credentials for future use? [Y/n]: "
-	if core.SavedCredentials != nil {
-		prompt = "Update the saved credentials with these? [Y/n]: "
+	existing, _, _ := core.LoadCredentialsForConfig(configName)
+
+	target := "future use"
+	if configName != "" {
+		target = fmt.Sprintf("the '%s' configuration", configName)
+	}
+
+	prompt := fmt.Sprintf("Save these credentials for %s? [Y/n]: ", target)
+	if existing != nil {
+		prompt = fmt.Sprintf("Update the saved credentials for %s? [Y/n]: ", target)
 	}
 	fmt.Print(prompt)
 
@@ -357,13 +396,11 @@ func (c *CLI) offerToSaveCredentials(creds core.MySQLCredentials) {
 		return
 	}
 
-	if err := core.SaveCredentialsToKeyring(creds); err != nil {
+	if err := core.SaveCredentialsForConfig(configName, creds); err != nil {
 		fmt.Printf("Warning: Failed to save credentials: %v\n", err)
 		return
 	}
 
-	saved := creds
-	core.SavedCredentials = &saved
 	fmt.Println("Credentials saved securely.")
 }
 

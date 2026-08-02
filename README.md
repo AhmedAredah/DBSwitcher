@@ -27,8 +27,9 @@ A powerful, cross-platform tool for managing multiple MariaDB/MySQL configuratio
 
 ### Security & Credentials
 
+- **Per-Configuration Credentials**: Each configuration has its own data directory and therefore its own accounts, so credentials are stored per configuration (`mysql_credentials:<config>` in the keyring) rather than shared
 - **Secure Storage**: Credentials stored safely using system keyring, and only after they are known to work
-- **Automatic Re-prompt**: If the stored password is rejected, you are asked for the current one and offered to update the keyring entry
+- **Automatic Re-prompt**: If the stored password is rejected, you are asked for the current one and offered to update that configuration's keyring entry
 - **No Password on the Command Line**: Credentials reach the client through a private options file, never through argv or the log
 - **Flexible Authentication**: Support for password and passwordless connections
 - **Session Management**: Remember credentials for the current session

@@ -147,3 +147,26 @@ func TestIsCredentialErrorUsesClientOutput(t *testing.T) {
 type errExitStatus1 struct{}
 
 func (errExitStatus1) Error() string { return "exit status 1" }
+
+func TestKeyringAccountFor(t *testing.T) {
+	// Every configuration has its own data directory and therefore its own
+	// accounts, so each needs its own keyring entry.
+	cases := map[string]string{
+		"":         "mysql_credentials",
+		"external": "mysql_credentials:external",
+		"internal": "mysql_credentials:internal",
+		// Config names come from file names, which are case-insensitive on
+		// Windows; the entry must not depend on how it was typed.
+		"External": "mysql_credentials:external",
+	}
+
+	for configName, want := range cases {
+		if got := KeyringAccountFor(configName); got != want {
+			t.Errorf("KeyringAccountFor(%q) = %q, want %q", configName, got, want)
+		}
+	}
+
+	if KeyringAccountFor("external") == KeyringAccountFor("internal") {
+		t.Error("two configurations must not share a keyring entry")
+	}
+}
