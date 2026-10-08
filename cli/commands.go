@@ -50,8 +50,14 @@ func (c *CLI) List() error {
 
 		fmt.Printf("\n   File: %s", config.Path)
 
-		// Mark active configuration (normalize paths for comparison)
-		if status.IsRunning && filepath.Clean(config.Path) == filepath.Clean(status.ConfigFile) {
+		// Mark the active configuration. Matching the name as well as the path
+		// recognises a server started outside DBSwitcher: the Windows service
+		// runs from its own my.ini but serves a known data directory.
+		active := status.IsRunning &&
+			(filepath.Clean(config.Path) == filepath.Clean(status.ConfigFile) ||
+				(status.ConfigName != "" && strings.EqualFold(status.ConfigName, config.Name)))
+
+		if active {
 			fmt.Printf("\n   Status: ✓ ACTIVE (PID: %d)", status.ProcessID)
 		} else {
 			fmt.Printf("\n   Status: Available")
@@ -82,6 +88,7 @@ func (c *CLI) Status() error {
 		if status.ConfigName != "" {
 			fmt.Printf("Configuration: %s\n", status.ConfigName)
 		}
+		printServiceLine(status)
 	} else if status.IsRunning {
 		fmt.Printf("Status: ✓ RUNNING\n")
 		fmt.Printf("Process ID: %d\n", status.ProcessID)
@@ -93,6 +100,7 @@ func (c *CLI) Status() error {
 		if status.Version != "" {
 			fmt.Printf("Version: %s\n", status.Version)
 		}
+		printServiceLine(status)
 	} else {
 		fmt.Printf("Status: ✗ STOPPED\n")
 	}
@@ -152,6 +160,7 @@ func (c *CLI) Switch(configName string) error {
 	}
 
 	// Start with new configuration
+	c.warnAboutServiceOverlap(targetConfig)
 	fmt.Printf("Starting MariaDB with %s configuration...\n", targetConfig.Name)
 
 	if err := core.StartMariaDBWithConfig(targetConfig.Path); err != nil {
@@ -199,6 +208,7 @@ func (c *CLI) Start(configName string) error {
 		return fmt.Errorf("MariaDB is already running with configuration '%s'", status.ConfigName)
 	}
 
+	c.warnAboutServiceOverlap(targetConfig)
 	fmt.Printf("Starting MariaDB with %s configuration...\n", targetConfig.Name)
 
 	if err := core.StartMariaDBWithConfig(targetConfig.Path); err != nil {
@@ -236,6 +246,13 @@ func (c *CLI) Stop() error {
 // keyring entry used to abort every switch with "shutdown failed: exit status 1".
 func (c *CLI) stopRunningInstance() error {
 	fmt.Println("Stopping MariaDB...")
+
+	// A server run by a Windows service has to be stopped through the service
+	// manager. A mariadb-admin shutdown does stop it, but the manager is left
+	// believing its service terminated unexpectedly.
+	if handled, err := c.stopServiceManagedServer(); handled {
+		return err
+	}
 
 	// Target the instance that is actually running rather than whatever port
 	// happens to be stored with the credentials.
@@ -295,6 +312,50 @@ func (c *CLI) stopRunningInstance() error {
 	}
 
 	return fmt.Errorf("failed to stop MariaDB: credentials rejected %d times", maxCredentialAttempts)
+}
+
+// stopServiceManagedServer stops the running server through the service
+// control manager when a service owns it. handled reports whether the stop
+// was carried out; false means fall back to a graceful shutdown with
+// credentials.
+func (c *CLI) stopServiceManagedServer() (handled bool, err error) {
+	status := core.GetMariaDBStatus()
+	if status.ServiceName == "" {
+		return false, nil
+	}
+
+	fmt.Printf("This server is run by the Windows service %s; stopping it through the service manager...\n",
+		status.ServiceName)
+
+	if err := core.StopWindowsService(status.ServiceName); err != nil {
+		// Stopping a service needs elevation, which the tool may not have.
+		fmt.Printf("Could not stop the service: %v\n", err)
+		fmt.Println("Falling back to a graceful shutdown with credentials. Windows will report that the")
+		fmt.Println("service stopped unexpectedly; run DBSwitcher as administrator to avoid that.")
+		return false, nil
+	}
+
+	if err := core.WaitForMariaDBStopped(status.ProcessID, status.Port, core.ShutdownTimeout()); err != nil {
+		return true, err
+	}
+
+	fmt.Printf("✓ Service %s stopped\n", status.ServiceName)
+	return true, nil
+}
+
+// warnAboutServiceOverlap points out a Windows service that serves the same
+// data directory as the configuration being started. The two are one database
+// reached two ways and cannot both hold the port, and an automatic service
+// takes it back after every reboot.
+func (c *CLI) warnAboutServiceOverlap(config *core.MariaDBConfig) {
+	service, ok := core.ServiceForDataDir(config.DataDir)
+	if !ok || !service.StartsAutomatically() {
+		return
+	}
+
+	fmt.Printf("Note: Windows service %s serves the same data directory and starts automatically,\n", service.Name)
+	fmt.Printf("      so it will claim port %s again after a reboot. Set it to manual start to avoid that:\n", config.Port)
+	fmt.Printf("      Set-Service -Name %s -StartupType Manual   (as administrator)\n", service.Name)
 }
 
 // promptForCredentials prompts the user for MySQL credentials. saved is the
@@ -421,6 +482,19 @@ func (c *CLI) offerToSaveCredentials(configName string, creds core.MySQLCredenti
 	}
 
 	fmt.Println("Credentials saved securely.")
+}
+
+// printServiceLine reports the Windows service that owns the running server.
+func printServiceLine(status core.MariaDBStatus) {
+	if status.ServiceName == "" {
+		return
+	}
+
+	fmt.Printf("Managed by: Windows service %s", status.ServiceName)
+	if status.ServiceStartMode != "" {
+		fmt.Printf(" (%s start)", strings.ToLower(status.ServiceStartMode))
+	}
+	fmt.Println()
 }
 
 // ShowHelp displays CLI help information

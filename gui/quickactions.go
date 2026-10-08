@@ -2,7 +2,6 @@ package gui
 
 import (
 	"fmt"
-	"time"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/container"
@@ -26,33 +25,33 @@ func CreateQuickActionsCard() *widget.Card {
 				go func(config core.MariaDBConfig) {
 					// Show starting notification
 					fyne.CurrentApp().SendNotification(&fyne.Notification{
-						Title:	"Starting MariaDB",
+						Title:   "Starting MariaDB",
 						Content: fmt.Sprintf("Starting %s configuration...", config.Name),
 					})
-					
+
 					err := core.StartMariaDBWithConfig(config.Path)
-					
+
 					// Update status after start attempt
 					RefreshMainUI()
-					
+
 					// Update UI on main thread
 					fyne.Do(func() {
 						fyne.CurrentApp().Driver().CanvasForObject(MainWindow.Content()).Refresh(MainWindow.Content())
-						
+
 						// Show result notification
 						if err != nil {
 							fyne.CurrentApp().SendNotification(&fyne.Notification{
-								Title:	"MariaDB Start Failed",
+								Title:   "MariaDB Start Failed",
 								Content: err.Error(),
 							})
 							dialog.ShowError(err, MainWindow)
 						} else {
 							fyne.CurrentApp().SendNotification(&fyne.Notification{
-								Title:	"MariaDB Started",
+								Title:   "MariaDB Started",
 								Content: fmt.Sprintf("Successfully started with %s configuration on port %s", config.Name, config.Port),
 							})
 							dialog.ShowInformation("Success",
-								fmt.Sprintf("MariaDB started with %s configuration\nPort: %s", config.Name, config.Port), 
+								fmt.Sprintf("MariaDB started with %s configuration\nPort: %s", config.Name, config.Port),
 								MainWindow)
 						}
 					})
@@ -79,26 +78,26 @@ func CreateQuickActionsCard() *widget.Card {
 		if core.CurrentStatus.IsRunning {
 			go func() {
 				fyne.CurrentApp().SendNotification(&fyne.Notification{
-					Title:	"Stopping MariaDB",
+					Title:   "Stopping MariaDB",
 					Content: "Stopping MariaDB service...",
 				})
-				
+
 				StopMariaDBServiceWithUI(MainWindow, func(err error) {
 					RefreshMainUI()
-					
+
 					// Force UI refresh
 					fyne.Do(func() {
 						fyne.CurrentApp().Driver().CanvasForObject(MainWindow.Content()).Refresh(MainWindow.Content())
-						
+
 						if err != nil {
 							fyne.CurrentApp().SendNotification(&fyne.Notification{
-								Title:	"Stop Failed",
+								Title:   "Stop Failed",
 								Content: err.Error(),
 							})
 							dialog.ShowError(err, MainWindow)
 						} else {
 							fyne.CurrentApp().SendNotification(&fyne.Notification{
-								Title:	"MariaDB Stopped",
+								Title:   "MariaDB Stopped",
 								Content: "MariaDB has been stopped successfully",
 							})
 							dialog.ShowInformation("Success", "MariaDB stopped successfully", MainWindow)
@@ -117,7 +116,7 @@ func CreateQuickActionsCard() *widget.Card {
 				if currentConfig == "" && core.AppConfig.LastUsedConfig != "" {
 					currentConfig = core.AppConfig.LastUsedConfig
 				}
-				
+
 				// Stop with UI credential handling
 				StopMariaDBServiceWithUI(MainWindow, func(stopErr error) {
 					if stopErr != nil {
@@ -127,14 +126,22 @@ func CreateQuickActionsCard() *widget.Card {
 						})
 						return
 					}
-					
-					time.Sleep(3 * time.Second)
-					
+
+					// Wait for the server to actually be gone instead of
+					// assuming three seconds: a large buffer pool takes
+					// longer, and the port is freed a moment after it exits.
+					if waitErr := core.WaitForMariaDBStopped(0, core.CurrentStatus.Port, core.ShutdownTimeout()); waitErr != nil {
+						fyne.Do(func() {
+							dialog.ShowError(waitErr, MainWindow)
+						})
+						return
+					}
+
 					// Start with same config
 					if currentConfig != "" {
 						startErr := core.StartMariaDBWithConfig(currentConfig)
 						RefreshMainUI()
-						
+
 						// Update UI on main thread
 						fyne.Do(func() {
 							if startErr != nil {
@@ -154,9 +161,9 @@ func CreateQuickActionsCard() *widget.Card {
 	})
 
 	return widget.NewCard("Quick Actions", "", container.NewVBox(
-		container.NewBorder(nil, nil, 
-			widget.NewLabel("Start with:"), 
-			container.NewHBox(refreshBtn, startBtn), 
+		container.NewBorder(nil, nil,
+			widget.NewLabel("Start with:"),
+			container.NewHBox(refreshBtn, startBtn),
 			GlobalConfigSelect),
 		container.NewGridWithColumns(2, stopBtn, restartBtn),
 		openFolderBtn,
@@ -170,10 +177,10 @@ func RefreshConfigurations() {
 	if GlobalConfigSelect != nil {
 		currentSelection = GlobalConfigSelect.Selected
 	}
-	
+
 	// Rescan for configurations
 	core.ScanForConfigs()
-	
+
 	// Update dropdown if it exists
 	if GlobalConfigSelect != nil {
 		newOptions := []string{}
@@ -181,7 +188,7 @@ func RefreshConfigurations() {
 			newOptions = append(newOptions, cfg.Name)
 		}
 		GlobalConfigSelect.Options = newOptions
-		
+
 		// Restore selection if it still exists
 		for _, option := range newOptions {
 			if option == currentSelection {
@@ -189,15 +196,15 @@ func RefreshConfigurations() {
 				break
 			}
 		}
-		
+
 		GlobalConfigSelect.Refresh()
 	}
-	
+
 	// Update config list if it exists
 	if GlobalConfigList != nil {
 		GlobalConfigList.Refresh()
 	}
-	
+
 	// Show notification
 	if FyneApp != nil {
 		fyne.CurrentApp().SendNotification(&fyne.Notification{
@@ -213,15 +220,15 @@ func RefreshMainUI() {
 		// Use the UI-enabled version that can prompt for credentials
 		GetMariaDBStatusWithUI(MainWindow, func(status core.MariaDBStatus) {
 			core.CurrentStatus = status
-			
+
 			// Also refresh configurations
 			RefreshConfigurations()
-			
+
 			// Refresh all UI components in the main UI thread
 			fyne.Do(func() {
 				fyne.CurrentApp().Driver().CanvasForObject(MainWindow.Content()).Refresh(MainWindow.Content())
 			})
-			
+
 			// Update status card (already has its own fyne.Do() wrapper)
 			if StatusCardRef != nil {
 				UpdateStatusCard(StatusCardRef)

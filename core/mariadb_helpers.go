@@ -252,56 +252,47 @@ func ValidateDataDirectory(dataDir string) bool {
 
 // InitializeDataDir initializes a new MariaDB data directory
 func InitializeDataDir(dataDir string) error {
-	// Try mysql_install_db first
-	installDbPath := filepath.Join(AppConfig.MariaDBBin, "mysql_install_db")
-	if runtime.GOOS == "windows" {
-		installDbPath += ".exe"
-	}
-
-	if PathExists(installDbPath) {
-		cmd := exec.Command(installDbPath, "--datadir="+dataDir, "--auth-root-authentication-method=normal")
-		output, err := cmd.CombinedOutput()
-		if err != nil {
-			AppLogger.Log("mysql_install_db failed: %v\nOutput: %s", err, string(output))
-			return err
-		}
-		AppLogger.Log("Data directory initialized with mysql_install_db")
-		return nil
-	}
-
-	// Try mysqld --initialize-insecure
-	mysqldPath := filepath.Join(AppConfig.MariaDBBin, "mysqld")
-	if runtime.GOOS == "windows" {
-		mysqldPath += ".exe"
-	}
-
-	cmd := exec.Command(mysqldPath, "--initialize-insecure", "--datadir="+dataDir)
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		AppLogger.Log("mysqld --initialize-insecure failed: %v\nOutput: %s", err, string(output))
-		return err
-	}
-
-	AppLogger.Log("Data directory initialized with mysqld --initialize-insecure")
-	return nil
+	return initializeDataDir(dataDir, "")
 }
 
 // InitializeDataDirAlternative tries alternative methods to initialize data directory
 func InitializeDataDirAlternative(dataDir, configFile string) error {
-	mysqldPath := filepath.Join(AppConfig.MariaDBBin, "mysqld")
-	if runtime.GOOS == "windows" {
-		mysqldPath += ".exe"
+	return initializeDataDir(dataDir, configFile)
+}
+
+// initializeDataDir runs MariaDB's installer over a fresh data directory.
+//
+// The flags used before belonged to other products: no data directory was ever
+// initialised, because mariadb-install-db.exe knows nothing of
+// --auth-root-authentication-method (that is the Unix script's option) and
+// MariaDB's server has no --initialize-insecure (that is MySQL's). Both paths
+// failed with "unknown option". The Windows installer takes --datadir and an
+// optional --config template; elsewhere it takes --defaults-file.
+func initializeDataDir(dataDir, configFile string) error {
+	installer, err := findClientBinary("mariadb-install-db", "mysql_install_db")
+	if err != nil {
+		return fmt.Errorf("cannot initialize %s: %v", dataDir, err)
 	}
 
-	// Try with config file
-	cmd := exec.Command(mysqldPath, "--defaults-file="+configFile, "--initialize-insecure")
+	args := []string{"--datadir=" + dataDir}
+	if configFile != "" && PathExists(configFile) {
+		if runtime.GOOS == "windows" {
+			args = append(args, "--config="+configFile)
+		} else {
+			args = append(args, "--defaults-file="+configFile)
+		}
+	}
+
+	AppLogger.Log("Initializing data directory: %s %s", filepath.Base(installer), strings.Join(args, " "))
+
+	cmd := exec.Command(installer, args...)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		AppLogger.Log("Alternative initialization failed: %v\nOutput: %s", err, string(output))
-		return fmt.Errorf("failed to initialize data directory: %v", err)
+		AppLogger.Error("Data directory initialization failed: %v - %s", err, strings.TrimSpace(string(output)))
+		return fmt.Errorf("initializing %s failed: %s", dataDir, ParseMariaDBError(string(output)))
 	}
 
-	AppLogger.Log("Data directory initialized with alternative method")
+	AppLogger.Log("Data directory initialized: %s", dataDir)
 	return nil
 }
 

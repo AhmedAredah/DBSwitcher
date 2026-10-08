@@ -52,6 +52,13 @@ func GetMariaDBStatus() MariaDBStatus {
 	status.IsRunning = true
 	status.ProcessID = proc.PID
 
+	// Note when the server belongs to a Windows service: it has to be stopped
+	// through the service manager, not behind its back.
+	if service, ok := ServiceForProcess(proc.PID); ok {
+		status.ServiceName = service.Name
+		status.ServiceStartMode = service.StartMode
+	}
+
 	// Log the command line for debugging
 	AppLogger.Debug("Found MariaDB process with command line: %s", proc.CommandLine)
 
@@ -430,14 +437,34 @@ func WaitForMariaDBStopped(pid int, port string, timeout time.Duration) error {
 }
 
 func extractConfigFromCmdLine(cmdLine string) string {
-	// Look for --defaults-file= parameter
-	if idx := strings.Index(cmdLine, "--defaults-file="); idx != -1 {
-		start := idx + len("--defaults-file=")
-		end := strings.IndexAny(cmdLine[start:], " \t\n")
-		if end == -1 {
-			return strings.Trim(cmdLine[start:], "\"'")
+	const flag = "--defaults-file="
+
+	if idx := strings.Index(cmdLine, flag); idx != -1 {
+		start := idx + len(flag)
+
+		// The service control manager quotes each argument whole, as
+		// "--defaults-file=C:\...\my.ini", and such a path contains spaces
+		// here ("MariaDB 11.4"), so the value cannot end at the first space.
+		if idx > 0 && (cmdLine[idx-1] == '"' || cmdLine[idx-1] == '\'') {
+			if end := strings.IndexByte(cmdLine[start:], cmdLine[idx-1]); end != -1 {
+				return cmdLine[start : start+end]
+			}
+			return cmdLine[start:]
 		}
-		return strings.Trim(cmdLine[start:start+end], "\"'")
+
+		// Or just the value is quoted: --defaults-file="C:\...\my.ini".
+		if start < len(cmdLine) && (cmdLine[start] == '"' || cmdLine[start] == '\'') {
+			quote := cmdLine[start]
+			if end := strings.IndexByte(cmdLine[start+1:], quote); end != -1 {
+				return cmdLine[start+1 : start+1+end]
+			}
+			return cmdLine[start+1:]
+		}
+
+		if end := strings.IndexAny(cmdLine[start:], " \t\n"); end != -1 {
+			return strings.Trim(cmdLine[start:start+end], "\"'")
+		}
+		return strings.Trim(cmdLine[start:], "\"'")
 	}
 
 	// Look for --defaults-file parameter with space

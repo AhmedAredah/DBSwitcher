@@ -131,11 +131,11 @@ func IsDriveRemovable(path string) bool {
 	if runtime.GOOS != "windows" {
 		return false
 	}
-	
+
 	if len(path) < 2 || path[1] != ':' {
 		return false
 	}
-	
+
 	// Use PowerShell to get drive type
 	cmd := exec.Command("powershell", "-NoProfile", "-Command",
 		fmt.Sprintf("(Get-WmiObject Win32_LogicalDisk -Filter \"Name='%s'\").DriveType", path[:2]))
@@ -143,12 +143,12 @@ func IsDriveRemovable(path string) bool {
 	if err != nil {
 		return false
 	}
-	
+
 	driveType := strings.TrimSpace(string(output))
 	if driveType == "2" { // Removable Disk
 		return true
 	}
-	
+
 	return false
 }
 
@@ -212,8 +212,19 @@ func CheckElevationRequired() bool {
 func CheckServiceControlAvailable() bool {
 	switch runtime.GOOS {
 	case "windows":
-		cmd := exec.Command("sc", "query", AppConfig.ServiceNames["windows"])
-		return cmd.Run() == nil
+		// Find the service by the binary it runs; its name follows the version
+		// ("MariaDB11_4"), so the "MariaDB" guessed here matched nothing and
+		// service control was always reported unavailable.
+		services, err := FindServerServices()
+		if err != nil || len(services) == 0 {
+			return false
+		}
+
+		if AppConfig.ServiceNames == nil {
+			AppConfig.ServiceNames = map[string]string{}
+		}
+		AppConfig.ServiceNames["windows"] = services[0].Name
+		return true
 	case "linux":
 		cmd := exec.Command("systemctl", "status", AppConfig.ServiceNames["linux"])
 		return cmd.Run() == nil

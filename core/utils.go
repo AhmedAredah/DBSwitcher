@@ -1,6 +1,8 @@
 package core
 
 import (
+	"errors"
+	"io"
 	"net"
 	"os"
 	"runtime"
@@ -30,11 +32,16 @@ func IsDirEmpty(dir string) (bool, error) {
 	}
 	defer f.Close()
 
-	_, err = f.Readdirnames(1)
-	if err == os.ErrNotExist || err == nil {
-		return err != nil, nil
+	// Readdirnames reports io.EOF for an empty directory. The old check looked
+	// for os.ErrNotExist, which it never returns, so an empty data directory
+	// was reported as populated and therefore never initialised.
+	if _, err = f.Readdirnames(1); errors.Is(err, io.EOF) {
+		return true, nil
+	} else if err != nil {
+		return false, err
 	}
-	return false, err
+
+	return false, nil
 }
 
 // IsPortAvailable checks if a port is free on every wildcard address family

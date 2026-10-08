@@ -53,6 +53,10 @@ type MariaDBStatus struct {
 	Port            string `json:"port"`
 	ServiceName     string `json:"service_name,omitempty"`
 
+	// ServiceStartMode is the service's start type, which says whether it
+	// will claim the port again on its own after a reboot.
+	ServiceStartMode string `json:"service_start_mode,omitempty"`
+
 	// Responding reports whether the server answered the client protocol. An
 	// open port is not the same as a usable database.
 	Responding bool `json:"responding"`
