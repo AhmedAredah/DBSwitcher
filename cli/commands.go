@@ -70,7 +70,19 @@ func (c *CLI) Status() error {
 
 	status := core.GetMariaDBStatus()
 
-	if status.IsRunning {
+	if status.IsRunning && !status.Responding {
+		// The process is there and the port is open, but the server will not
+		// serve. Saying "RUNNING" here is how a broken database looked fine.
+		fmt.Printf("Status: ⚠ RUNNING BUT NOT USABLE\n")
+		if status.StatusMessage != "" {
+			fmt.Printf("Problem: %s\n", status.StatusMessage)
+		}
+		fmt.Printf("Process ID: %d\n", status.ProcessID)
+		fmt.Printf("Port: %s\n", status.Port)
+		if status.ConfigName != "" {
+			fmt.Printf("Configuration: %s\n", status.ConfigName)
+		}
+	} else if status.IsRunning {
 		fmt.Printf("Status: ✓ RUNNING\n")
 		fmt.Printf("Process ID: %d\n", status.ProcessID)
 		fmt.Printf("Configuration: %s\n", status.ConfigName)

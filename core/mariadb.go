@@ -112,8 +112,23 @@ func GetMariaDBStatus() MariaDBStatus {
 		status.Port = getCurrentPort()
 	}
 
-	// Try to get version
-	status.Version = GetMariaDBVersion()
+	// Ask the server whether it is usable, and take its version from the
+	// answer: GetMariaDBVersion reports the version of the installed binaries,
+	// which is printed just as happily when the server is unusable.
+	probe := ProbeServerPort(status.Port)
+	status.Responding = probe.Healthy()
+	status.StatusMessage = probe.Message
+
+	if probe.Version != "" {
+		status.Version = probe.Version
+	} else {
+		status.Version = GetMariaDBVersion()
+	}
+
+	if !status.Responding {
+		AppLogger.Warn("Server process %d holds port %s but is not usable: %s",
+			status.ProcessID, status.Port, probe.Message)
+	}
 
 	return status
 }
@@ -476,7 +491,11 @@ func extractPortFromCmdLine() string {
 	if !found {
 		return ""
 	}
-	cmdLine := proc.CommandLine
+	return extractPortFromArgs(proc.CommandLine)
+}
+
+// extractPortFromArgs reads a --port argument out of a command line.
+func extractPortFromArgs(cmdLine string) string {
 
 	// Look for --port= parameter
 	if idx := strings.Index(cmdLine, "--port="); idx != -1 {
@@ -866,7 +885,7 @@ func StartMariaDBWithConfig(configFile string) error {
 		maxRetries = 3 // fallback
 	}
 	for i := 0; i < maxRetries; i++ {
-		if IsPortListening(configData.Port) {
+		if ProbeServerPort(configData.Port).Healthy() {
 			AppLogger.Log("MariaDB is running and accepting connections")
 			break
 		}
@@ -874,17 +893,17 @@ func StartMariaDBWithConfig(configFile string) error {
 		time.Sleep(1 * time.Second)
 	}
 
-	// Final verification: the server has to be reachable, not merely present
-	// in the process list.
-	if !IsPortListening(configData.Port) {
+	// Final verification: the server has to answer, not merely be present in
+	// the process list with a socket open.
+	if probe := ProbeServerPort(configData.Port); !probe.Healthy() {
 		serverOutput := readServerLogFrom(serverLog.Name(), logOffset)
 		if serverOutput != "" {
 			AppLogger.Error(" Server output: %s", serverOutput)
 		}
 
 		if ServerProcessAlive(startedPID) {
-			return fmt.Errorf("MariaDB started (PID %d) but is not accepting connections on port %s - see %s",
-				startedPID, configData.Port, serverLog.Name())
+			return fmt.Errorf("MariaDB started (PID %d) but is not usable on port %s: %s - see %s",
+				startedPID, configData.Port, probe.Message, serverLog.Name())
 		}
 		if serverOutput != "" {
 			return fmt.Errorf("MariaDB failed to start: %s", ParseMariaDBError(serverOutput))

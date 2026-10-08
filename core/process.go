@@ -83,9 +83,37 @@ func annotateListeningPorts(procs []ProcessInfo) {
 	}
 
 	listeners := listeningPorts()
+
+	// netstat can fail, and on some Windows installs it prints state names
+	// this parser does not know. Rather than declare a live server stale,
+	// ask the port each server was told to use whether anything answers.
+	if len(listeners) == 0 {
+		for i := range procs {
+			if port := configuredPort(procs[i]); port != "" && IsPortListening(port) {
+				procs[i].Port = port
+			}
+		}
+		return
+	}
+
 	for i := range procs {
 		procs[i].Port = listeners[procs[i].PID]
 	}
+}
+
+// configuredPort works out which port a server was told to use, from its own
+// command line or from the configuration file named on it.
+func configuredPort(proc ProcessInfo) string {
+	if port := extractPortFromArgs(proc.CommandLine); port != "" {
+		return port
+	}
+
+	configFile := extractConfigFromCmdLine(proc.CommandLine)
+	if configFile == "" || !PathExists(configFile) {
+		return ""
+	}
+
+	return ParseConfigFile(configFile).Port
 }
 
 // listeningPorts maps process IDs to a TCP port they are listening on.

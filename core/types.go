@@ -52,7 +52,14 @@ type MariaDBStatus struct {
 	StaleProcessIDs []int  `json:"stale_process_ids,omitempty"`
 	Port            string `json:"port"`
 	ServiceName     string `json:"service_name,omitempty"`
-	Version         string `json:"version,omitempty"`
+
+	// Responding reports whether the server answered the client protocol. An
+	// open port is not the same as a usable database.
+	Responding bool `json:"responding"`
+
+	// StatusMessage explains why a running server is not usable.
+	StatusMessage string `json:"status_message,omitempty"`
+	Version       string `json:"version,omitempty"`
 }
 
 // MySQLCredentials represents database connection credentials

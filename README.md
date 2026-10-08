@@ -38,6 +38,8 @@ A powerful, cross-platform tool for managing multiple MariaDB/MySQL configuratio
 ### Advanced Features
 
 - **Real-time Monitoring**: Live status updates and process monitoring
+- **Health Checks, Not Guesses**: Status asks the server for its protocol greeting, so a process holding an open port is reported as `RUNNING BUT NOT USABLE` rather than healthy, and the version shown is the running server's
+- **Per-Configuration Server Logs**: Each server writes its own output to `mysqld-<config>.log` in the application data directory, so a failed start can be explained
 - **Port Detection**: Intelligent port detection using multiple methods
 - **Process Management**: Safe start/stop with proper cleanup
 - **Logging**: Comprehensive logging for troubleshooting
