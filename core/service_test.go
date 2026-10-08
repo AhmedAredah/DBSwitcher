@@ -127,3 +127,47 @@ func TestEscapeSingleQuotes(t *testing.T) {
 		t.Errorf("a quote must be doubled for PowerShell, got %q", got)
 	}
 }
+
+func TestServiceToStart(t *testing.T) {
+	AppLogger = &Logger{}
+
+	dir := t.TempDir()
+
+	serviceIni := filepath.Join(dir, "service.ini")
+	if err := os.WriteFile(serviceIni, []byte("[mysqld]\ndatadir=C:/ProgramData/MariaDB/MariaDB 11.4/data\nport=3306\n"), 0o644); err != nil {
+		t.Fatalf("setup failed: %v", err)
+	}
+
+	internal := MariaDBConfig{Name: "internal", DataDir: "C:/ProgramData/MariaDB/MariaDB 11.4/data", Port: "3306"}
+	external := MariaDBConfig{Name: "external", DataDir: "D:/MariaDB/data", Port: "3306"}
+
+	auto := ServiceInfo{Name: "MariaDB11_4", State: "Stopped", StartMode: "Auto", ConfigFile: serviceIni}
+	disabled := ServiceInfo{Name: "MariaDB11_4", State: "Stopped", StartMode: "Disabled", ConfigFile: serviceIni}
+
+	if service, ok := serviceToStart([]ServiceInfo{auto}, internal); !ok || service.Name != "MariaDB11_4" {
+		t.Errorf("a service serving the data directory should be used, got %+v / %v", service, ok)
+	}
+
+	// A different data directory is a different database.
+	if service, ok := serviceToStart([]ServiceInfo{auto}, external); ok {
+		t.Errorf("external must not be started through the service, got %q", service.Name)
+	}
+
+	// A disabled service cannot be started, so the standalone path must be used.
+	if _, ok := serviceToStart([]ServiceInfo{disabled}, internal); ok {
+		t.Error("a disabled service must not be chosen")
+	}
+
+	if _, ok := serviceToStart(nil, internal); ok {
+		t.Error("no services means no service start")
+	}
+
+	// A configuration with no data directory cannot be matched at all.
+	if _, ok := serviceToStart([]ServiceInfo{auto}, MariaDBConfig{Name: "nodir"}); ok {
+		t.Error("a configuration without a data directory must not match")
+	}
+
+	if disabled.IsDisabled() != true || auto.IsDisabled() != false {
+		t.Error("IsDisabled must follow the start mode")
+	}
+}

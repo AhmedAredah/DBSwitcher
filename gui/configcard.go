@@ -29,7 +29,7 @@ func CreateConfigCard() fyne.CanvasObject {
 			portLabel := widget.NewLabel("Port: 3306")
 			statusLabel := widget.NewLabel("Ready")
 			descLabel := widget.NewLabel("Description")
-			
+
 			return container.NewVBox(
 				container.NewHBox(nameLabel, layout.NewSpacer(), portLabel, statusLabel),
 				descLabel,
@@ -39,16 +39,16 @@ func CreateConfigCard() fyne.CanvasObject {
 		func(i widget.ListItemID, o fyne.CanvasObject) {
 			c := o.(*fyne.Container)
 			cfg := core.AvailableConfigs[i]
-			
+
 			topRow := c.Objects[0].(*fyne.Container)
 			nameLabel := topRow.Objects[0].(*widget.Label)
 			portLabel := topRow.Objects[2].(*widget.Label)
 			statusLabel := topRow.Objects[3].(*widget.Label)
 			descLabel := c.Objects[1].(*widget.Label)
-			
+
 			nameLabel.SetText(cfg.Name)
 			portLabel.SetText("Port: " + cfg.Port)
-			
+
 			status := "Ready"
 			if cfg.IsActive && core.CurrentStatus.IsRunning {
 				status = "● ACTIVE"
@@ -57,7 +57,7 @@ func CreateConfigCard() fyne.CanvasObject {
 				status = "Missing"
 			}
 			statusLabel.SetText(status)
-			
+
 			desc := cfg.Description
 			if desc == "" {
 				desc = fmt.Sprintf("Data: %s", cfg.DataDir)
@@ -76,7 +76,7 @@ func CreateConfigCard() fyne.CanvasObject {
 	updateStatusBar := func() {
 		fyne.Do(func() {
 			if core.CurrentStatus.IsRunning {
-				statusBar.SetText(fmt.Sprintf("MariaDB is running with %s configuration on port %s", 
+				statusBar.SetText(fmt.Sprintf("MariaDB is running with %s configuration on port %s",
 					core.CurrentStatus.ConfigName, core.CurrentStatus.Port))
 			} else {
 				statusBar.SetText("MariaDB is not running")
@@ -90,18 +90,18 @@ func CreateConfigCard() fyne.CanvasObject {
 		if selectedConfig >= 0 && selectedConfig < len(core.AvailableConfigs) {
 			cfg := core.AvailableConfigs[selectedConfig]
 			statusBar.SetText(fmt.Sprintf("Starting %s configuration...", cfg.Name))
-			
+
 			go func(config core.MariaDBConfig) {
-				err := core.StartMariaDBWithConfig(config.Path)
-				
+				err := core.StartMariaDBForConfig(config, true)
+
 				// Update status after operation
 				RefreshMainUI()
-				
+
 				// Update UI on main thread
 				fyne.Do(func() {
 					fyne.CurrentApp().Driver().CanvasForObject(GlobalConfigList).Refresh(GlobalConfigList)
 					updateStatusBar()
-					
+
 					if err != nil {
 						fyne.CurrentApp().SendNotification(&fyne.Notification{
 							Title:   "Start Failed",
@@ -115,7 +115,7 @@ func CreateConfigCard() fyne.CanvasObject {
 							Content: fmt.Sprintf("Successfully started %s on port %s", config.Name, config.Port),
 						})
 						dialog.ShowInformation("Success",
-							fmt.Sprintf("Started MariaDB with %s configuration\nPort: %s\nData: %s", 
+							fmt.Sprintf("Started MariaDB with %s configuration\nPort: %s\nData: %s",
 								config.Name, config.Port, config.DataDir), MainWindow)
 						GlobalConfigList.Refresh()
 						updateStatusBar()

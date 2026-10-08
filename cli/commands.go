@@ -13,11 +13,16 @@ import (
 )
 
 // CLI represents the command-line interface
-type CLI struct{}
+type CLI struct {
+	// UseService allows a configuration to be started through the Windows
+	// service that serves its data directory. Clear it to force a standalone
+	// server, for a configuration whose settings differ from the service's.
+	UseService bool
+}
 
 // NewCLI creates a new CLI instance
 func NewCLI() *CLI {
-	return &CLI{}
+	return &CLI{UseService: true}
 }
 
 // List displays all available configurations
@@ -160,11 +165,8 @@ func (c *CLI) Switch(configName string) error {
 	}
 
 	// Start with new configuration
-	c.warnAboutServiceOverlap(targetConfig)
-	fmt.Printf("Starting MariaDB with %s configuration...\n", targetConfig.Name)
-
-	if err := core.StartMariaDBWithConfig(targetConfig.Path); err != nil {
-		return fmt.Errorf("failed to start MariaDB: %v", err)
+	if err := c.startConfig(targetConfig); err != nil {
+		return err
 	}
 
 	fmt.Printf("✓ Successfully switched to %s configuration\n", targetConfig.Name)
@@ -208,11 +210,8 @@ func (c *CLI) Start(configName string) error {
 		return fmt.Errorf("MariaDB is already running with configuration '%s'", status.ConfigName)
 	}
 
-	c.warnAboutServiceOverlap(targetConfig)
-	fmt.Printf("Starting MariaDB with %s configuration...\n", targetConfig.Name)
-
-	if err := core.StartMariaDBWithConfig(targetConfig.Path); err != nil {
-		return fmt.Errorf("failed to start MariaDB: %v", err)
+	if err := c.startConfig(targetConfig); err != nil {
+		return err
 	}
 
 	fmt.Printf("✓ MariaDB started successfully\n")
@@ -343,10 +342,35 @@ func (c *CLI) stopServiceManagedServer() (handled bool, err error) {
 	return true, nil
 }
 
+// startConfig starts a configuration, through the Windows service that serves
+// its data directory where there is one, and says which it used: the service
+// runs with its own options file, which need not match the configuration.
+func (c *CLI) startConfig(config *core.MariaDBConfig) error {
+	if service, viaService := core.ServiceToStartFor(*config, c.UseService); viaService {
+		fmt.Printf("Starting MariaDB through Windows service %s...\n", service.Name)
+		if service.ConfigFile != "" {
+			fmt.Printf("  Options file in effect: %s\n", service.ConfigFile)
+		}
+
+		if err := core.StartMariaDBForConfig(*config, c.UseService); err != nil {
+			return fmt.Errorf("failed to start the %s service: %v", service.Name, err)
+		}
+		return nil
+	}
+
+	c.warnAboutServiceOverlap(config)
+	fmt.Printf("Starting MariaDB with %s configuration...\n", config.Name)
+
+	if err := core.StartMariaDBForConfig(*config, false); err != nil {
+		return fmt.Errorf("failed to start MariaDB: %v", err)
+	}
+	return nil
+}
+
 // warnAboutServiceOverlap points out a Windows service that serves the same
-// data directory as the configuration being started. The two are one database
-// reached two ways and cannot both hold the port, and an automatic service
-// takes it back after every reboot.
+// data directory as the configuration being started as a standalone server.
+// The two are one database reached two ways and cannot both hold the port, and
+// an automatic service takes it back after every reboot.
 func (c *CLI) warnAboutServiceOverlap(config *core.MariaDBConfig) {
 	service, ok := core.ServiceForDataDir(config.DataDir)
 	if !ok || !service.StartsAutomatically() {
@@ -513,6 +537,10 @@ COMMANDS:
     gui                     Launch the GUI interface
     tray                    Run in system tray mode
     help                    Show this help message
+
+OPTIONS:
+    --no-service            Start a standalone server even when a Windows
+                            service serves that configuration's data directory
 
 EXAMPLES:
     dbswitcher list                    # List all configurations

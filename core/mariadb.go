@@ -397,15 +397,53 @@ func matchesProcessName(cmdLine string, names []string) bool {
 	return false
 }
 
-// ShutdownTimeout returns how long to wait for a server to stop. Flushing a
-// large InnoDB buffer pool routinely takes longer than the configured process
+// ShutdownTimeout returns how long to wait for a server to stop.
+func ShutdownTimeout() time.Duration { return serverWaitTimeout() }
+
+// StartupTimeout returns how long to wait for a server to start answering.
+func StartupTimeout() time.Duration { return serverWaitTimeout() }
+
+// serverWaitTimeout bounds waiting on a server. Flushing or recovering a large
+// InnoDB buffer pool routinely takes longer than the configured process
 // timeout, so a one minute floor applies.
-func ShutdownTimeout() time.Duration {
+func serverWaitTimeout() time.Duration {
 	seconds := AppConfig.ProcessTimeoutSecs
 	if seconds < 60 {
 		seconds = 60
 	}
 	return time.Duration(seconds) * time.Second
+}
+
+// WaitForMariaDBServing blocks until a usable server answers on port.
+//
+// When pid is given it gives up as soon as that process is gone, so a server
+// that aborts is reported at once while one doing crash recovery is given the
+// full timeout.
+func WaitForMariaDBServing(pid int, port string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	lastState := "no answer yet"
+
+	for {
+		probe := ProbeServerPort(port)
+		if probe.Healthy() {
+			AppLogger.Log("MariaDB is accepting connections on port %s", port)
+			return nil
+		}
+		if probe.Message != "" {
+			lastState = probe.Message
+		}
+
+		if pid > 0 && !ServerProcessAlive(pid) {
+			return fmt.Errorf("the server exited before accepting connections on port %s (%s)", port, lastState)
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("timed out after %s waiting for MariaDB to accept connections on port %s (%s)",
+				timeout, port, lastState)
+		}
+
+		AppLogger.Debug("Waiting for the server to answer: %s", lastState)
+		time.Sleep(1 * time.Second)
+	}
 }
 
 // WaitForMariaDBStopped blocks until no server process remains and port is
@@ -897,45 +935,19 @@ func StartMariaDBWithConfig(configFile string) error {
 		AppLogger.Log("Process successfully detached from parent")
 	}
 
-	// Brief wait to allow process to initialize before verification
-	initWaitTime := 3
-	if AppConfig.ProcessTimeoutSecs > 10 {
-		initWaitTime = AppConfig.ProcessTimeoutSecs / 10 // Use 10% of process timeout for init wait
-	}
-	AppLogger.Info("Waiting %d seconds for MariaDB to initialize...", initWaitTime)
-	time.Sleep(time.Duration(initWaitTime) * time.Second)
-
-	// Additional verification - try to connect
-	AppLogger.Info("Verifying MariaDB is accessible...")
-	maxRetries := AppConfig.MaxRetryAttempts
-	if maxRetries <= 0 {
-		maxRetries = 3 // fallback
-	}
-	for i := 0; i < maxRetries; i++ {
-		if ProbeServerPort(configData.Port).Healthy() {
-			AppLogger.Log("MariaDB is running and accepting connections")
-			break
-		}
-		AppLogger.Log("Waiting for MariaDB to be ready... (%d/%d)", i+1, maxRetries)
-		time.Sleep(1 * time.Second)
-	}
-
-	// Final verification: the server has to answer, not merely be present in
-	// the process list with a socket open.
-	if probe := ProbeServerPort(configData.Port); !probe.Healthy() {
+	// Wait for the server to answer, rather than sleeping a fixed three
+	// seconds and then retrying a fixed number of times: a data directory
+	// needing recovery takes longer, and a server that aborts is noticed as
+	// soon as its process is gone.
+	AppLogger.Info("Waiting for MariaDB to accept connections...")
+	if err := WaitForMariaDBServing(startedPID, configData.Port, StartupTimeout()); err != nil {
 		serverOutput := readServerLogFrom(serverLog.Name(), logOffset)
 		if serverOutput != "" {
 			AppLogger.Error(" Server output: %s", serverOutput)
+			return fmt.Errorf("MariaDB failed to start: %s - see %s",
+				ParseMariaDBError(serverOutput), serverLog.Name())
 		}
-
-		if ServerProcessAlive(startedPID) {
-			return fmt.Errorf("MariaDB started (PID %d) but is not usable on port %s: %s - see %s",
-				startedPID, configData.Port, probe.Message, serverLog.Name())
-		}
-		if serverOutput != "" {
-			return fmt.Errorf("MariaDB failed to start: %s", ParseMariaDBError(serverOutput))
-		}
-		return fmt.Errorf("MariaDB failed to start - see %s", serverLog.Name())
+		return fmt.Errorf("MariaDB failed to start: %v - see %s", err, serverLog.Name())
 	}
 
 	// Save the last used config

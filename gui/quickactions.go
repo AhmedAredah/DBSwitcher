@@ -29,7 +29,7 @@ func CreateQuickActionsCard() *widget.Card {
 						Content: fmt.Sprintf("Starting %s configuration...", config.Name),
 					})
 
-					err := core.StartMariaDBWithConfig(config.Path)
+					err := core.StartMariaDBForConfig(config, true)
 
 					// Update status after start attempt
 					RefreshMainUI()
@@ -139,7 +139,12 @@ func CreateQuickActionsCard() *widget.Card {
 
 					// Start with same config
 					if currentConfig != "" {
-						startErr := core.StartMariaDBWithConfig(currentConfig)
+						var startErr error
+						if config := core.FindConfigByPath(currentConfig); config != nil {
+							startErr = core.StartMariaDBForConfig(*config, true)
+						} else {
+							startErr = core.StartMariaDBWithConfig(currentConfig)
+						}
 						RefreshMainUI()
 
 						// Update UI on main thread

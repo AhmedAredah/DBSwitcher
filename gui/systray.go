@@ -158,7 +158,7 @@ func onTrayReady() {
 							cfg := core.AvailableConfigs[i]
 							core.AppLogger.Log("Starting MariaDB with config: %s", cfg.Name)
 							go func(config core.MariaDBConfig) {
-								err := core.StartMariaDBWithConfig(config.Path)
+								err := core.StartMariaDBForConfig(config, true)
 								if err != nil {
 									core.AppLogger.Log("Failed to start %s: %v", config.Name, err)
 								} else {
@@ -184,7 +184,7 @@ func onTrayExit() {
 // updateTrayIcon updates the tray icon and tooltip based on MariaDB status
 func updateTrayIcon() {
 	status := core.GetMariaDBStatus()
-	
+
 	if status.IsRunning {
 		systray.SetTitle("DBSwitcher ✓")
 		// Sanitize tooltip text to prevent systray errors
@@ -207,4 +207,3 @@ func updateTrayIcon() {
 		systray.SetTooltip("MariaDB Stopped")
 	}
 }
-

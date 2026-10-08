@@ -12,10 +12,27 @@ import (
 
 // Version information - these can be set at build time
 var (
-	Version     = "0.0.1"                                    // Set via -ldflags at build time
-	BuildDate   = "unknown"                                  // Set via -ldflags at build time  
+	Version     = "0.0.1"   // Set via -ldflags at build time
+	BuildDate   = "unknown" // Set via -ldflags at build time
 	Description = "MariaDB Configuration Manager"
 )
+
+// extractFlag removes a flag from the arguments and reports whether it was
+// present.
+func extractFlag(args []string, flag string) ([]string, bool) {
+	remaining := make([]string, 0, len(args))
+	found := false
+
+	for _, arg := range args {
+		if arg == flag {
+			found = true
+			continue
+		}
+		remaining = append(remaining, arg)
+	}
+
+	return remaining, found
+}
 
 // displayVersion returns the version with exactly one leading "v". The build
 // passes the git tag, which already carries one, so a plain "v%s" printed
@@ -31,8 +48,10 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Parse command line arguments
-	if len(os.Args) < 2 {
+	// Options may appear anywhere; take them out before reading the command.
+	args, noService := extractFlag(os.Args[1:], "--no-service")
+
+	if len(args) == 0 {
 		// Default to GUI mode
 		startMinimized := core.AppConfig.StartMinimized
 		core.AppLogger.Log("Starting application in GUI mode (no arguments provided), minimized: %t", startMinimized)
@@ -44,8 +63,8 @@ func main() {
 		return
 	}
 
-	command := os.Args[1]
-	
+	command := args[0]
+
 	// Check for --minimized flag
 	if command == "--minimized" {
 		core.AppLogger.Log("Starting application in GUI mode (minimized)")
@@ -55,10 +74,11 @@ func main() {
 		}
 		return
 	}
-	
+
 	core.AppLogger.Log("Executing command: %s", command)
-	
+
 	cli := cli.NewCLI()
+	cli.UseService = !noService
 
 	switch command {
 	case "list":
@@ -76,12 +96,12 @@ func main() {
 		}
 
 	case "start":
-		if len(os.Args) < 3 {
+		if len(args) < 2 {
 			fmt.Println("Error: Configuration name required")
 			fmt.Println("Usage: dbswitcher start <config-name>")
 			os.Exit(1)
 		}
-		configName := os.Args[2]
+		configName := args[1]
 		core.AppLogger.Log("Starting MariaDB with configuration: %s", configName)
 		if err := cli.Start(configName); err != nil {
 			core.AppLogger.Log("Start command failed: %v", err)
@@ -90,12 +110,12 @@ func main() {
 		}
 
 	case "switch":
-		if len(os.Args) < 3 {
+		if len(args) < 2 {
 			fmt.Println("Error: Configuration name required")
 			fmt.Println("Usage: dbswitcher switch <config-name>")
 			os.Exit(1)
 		}
-		configName := os.Args[2]
+		configName := args[1]
 		core.AppLogger.Log("Switching to configuration: %s", configName)
 		if err := cli.Switch(configName); err != nil {
 			core.AppLogger.Log("Switch command failed: %v", err)
@@ -147,14 +167,14 @@ func main() {
 func initializeApplication() error {
 	// Initialize core configuration and logging
 	core.Init()
-	
+
 	// Initialize credential management
 	core.InitCredentials()
-	
+
 	// Log application startup
 	core.AppLogger.Log("DBSwitcher %s started", displayVersion())
 	core.AppLogger.Log("Configuration directory: %s", core.AppConfig.ConfigPath)
 	core.AppLogger.Log("MariaDB binary directory: %s", core.AppConfig.MariaDBBin)
-	
+
 	return nil
 }

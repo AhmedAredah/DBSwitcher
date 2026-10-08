@@ -217,3 +217,134 @@ func StopWindowsService(name string) error {
 func escapeSingleQuotes(value string) string {
 	return strings.ReplaceAll(value, "'", "''")
 }
+
+// IsDisabled reports whether the service cannot be started at all.
+func (s ServiceInfo) IsDisabled() bool { return strings.EqualFold(s.StartMode, "Disabled") }
+
+// StartWindowsService starts a service through the service control manager.
+func StartWindowsService(name string) error {
+	if runtime.GOOS != "windows" {
+		return fmt.Errorf("not a Windows host")
+	}
+	if name == "" {
+		return fmt.Errorf("no service name")
+	}
+
+	AppLogger.Log("Starting Windows service %s through the service control manager...", name)
+
+	command := fmt.Sprintf("Start-Service -Name '%s' -WarningAction SilentlyContinue -ErrorAction Stop",
+		escapeSingleQuotes(name))
+	if _, err := runPowerShell(command); err != nil {
+		return fmt.Errorf("could not start service %s: %v", name, err)
+	}
+
+	RefreshServerServices()
+	return nil
+}
+
+// ServiceToStartFor returns the service that would be used to start a
+// configuration, so callers can say so before starting it.
+func ServiceToStartFor(config MariaDBConfig, useService bool) (ServiceInfo, bool) {
+	if !useService {
+		return ServiceInfo{}, false
+	}
+
+	services, err := FindServerServices()
+	if err != nil {
+		AppLogger.Debug("Could not look for a service for '%s': %v", config.Name, err)
+		return ServiceInfo{}, false
+	}
+
+	return serviceToStart(services, config)
+}
+
+// serviceToStart picks the service that serves a configuration's data
+// directory and can actually be started.
+func serviceToStart(services []ServiceInfo, config MariaDBConfig) (ServiceInfo, bool) {
+	if config.DataDir == "" {
+		return ServiceInfo{}, false
+	}
+
+	for _, service := range services {
+		if service.IsDisabled() {
+			continue
+		}
+		if service.ConfigFile == "" || !PathExists(service.ConfigFile) {
+			continue
+		}
+		if sameDirectory(ParseConfigFile(service.ConfigFile).DataDir, config.DataDir) {
+			return service, true
+		}
+	}
+
+	return ServiceInfo{}, false
+}
+
+// StartMariaDBForConfig starts the server for a configuration.
+//
+// When a Windows service serves the same data directory, that service is
+// started rather than a second server of our own. The two are one database
+// reached two ways: they cannot both hold the port, and starting ours leaves
+// the service manager believing its service is stopped while the data
+// directory is in use.
+//
+// useService false forces a standalone server, for a configuration whose
+// settings differ from the service's own.
+func StartMariaDBForConfig(config MariaDBConfig, useService bool) error {
+	service, viaService := ServiceToStartFor(config, useService)
+	if !viaService {
+		return StartMariaDBWithConfig(config.Path)
+	}
+
+	return startThroughService(service, config)
+}
+
+// startThroughService starts a service and waits until its server answers.
+func startThroughService(service ServiceInfo, config MariaDBConfig) error {
+	AppLogger.Log("========================================")
+	AppLogger.Log("STARTING MARIADB SERVICE %s", service.Name)
+	AppLogger.Log("========================================")
+
+	// The service runs with its own options file, so its port is what matters.
+	port := config.Port
+	if service.ConfigFile != "" && PathExists(service.ConfigFile) {
+		if servicePort := ParseConfigFile(service.ConfigFile).Port; servicePort != "" {
+			port = servicePort
+		}
+	}
+
+	// The same pre-flight a standalone start gets: nothing may be serving, and
+	// the port has to be free.
+	serving, isServing, err := FindServingServer()
+	if err != nil {
+		return fmt.Errorf("cannot determine whether MariaDB is running: %v", err)
+	}
+	if isServing {
+		return fmt.Errorf("MariaDB is already running on port %s (PID %d) - please stop it first",
+			serving.Port, serving.PID)
+	}
+	if !IsPortAvailable(port) {
+		AppLogger.Log("Port %s is still in use", port)
+		FindProcessUsingPort(port)
+		return fmt.Errorf("cannot start - port %s is occupied by another process", port)
+	}
+
+	if err := StartWindowsService(service.Name); err != nil {
+		return err
+	}
+
+	if err := WaitForMariaDBServing(0, port, StartupTimeout()); err != nil {
+		return fmt.Errorf("service %s was started but %v", service.Name, err)
+	}
+
+	AppConfig.LastUsedConfig = config.Path
+	SaveConfig()
+	CurrentStatus = GetMariaDBStatus()
+
+	AppLogger.Info("========================================")
+	AppLogger.Info("MARIADB SERVICE STARTED SUCCESSFULLY")
+	AppLogger.Info("========================================")
+
+	NotifyMariaDBStarted(config.Name)
+	return nil
+}
