@@ -185,6 +185,10 @@ func StopMySQLWithCredentials(creds MySQLCredentials) error {
 	AppLogger.Log("Executing graceful shutdown with %s...", filepath.Base(adminPath))
 	AppLogger.Log("Command: %s -h %s -P %s -u %s shutdown", adminPath, creds.Host, creds.Port, creds.Username)
 
+	// Note which server is being stopped, so the wait afterwards follows that
+	// process rather than any mysqld that happens to exist.
+	target, _, _ := FindServingServer()
+
 	cmd := exec.Command(adminPath, args...)
 	output, err := cmd.CombinedOutput()
 
@@ -196,7 +200,7 @@ func StopMySQLWithCredentials(creds MySQLCredentials) error {
 	// The shutdown command only asks; wait until the server is really gone
 	// instead of assuming a fixed three seconds is enough.
 	AppLogger.Log("Shutdown accepted, waiting for the server to exit...")
-	if err := WaitForMariaDBStopped(creds.Port, ShutdownTimeout()); err != nil {
+	if err := WaitForMariaDBStopped(target.PID, creds.Port, ShutdownTimeout()); err != nil {
 		AppLogger.Error("%v", err)
 		return err
 	}
@@ -227,25 +231,6 @@ func GetCredentialsForRunningInstance() MySQLCredentials {
 	return creds
 }
 
-// ValidateConfigFile validates a MariaDB configuration file
-func ValidateConfigFile(mysqldPath, configFile string) error {
-	cmd := exec.Command(mysqldPath, "--defaults-file="+configFile, "--validate-config")
-	output, err := cmd.CombinedOutput()
-	if err == nil {
-		return nil
-	}
-
-	// Some builds exit non-zero without printing anything; reporting that as a
-	// validation failure only trained everyone to ignore the warning.
-	message := strings.TrimSpace(string(output))
-	if message == "" {
-		AppLogger.Debug("Config validation exited with %v and no output", err)
-		return nil
-	}
-
-	return fmt.Errorf("config validation failed: %s", message)
-}
-
 // ValidateDataDirectory checks if a data directory has required files
 func ValidateDataDirectory(dataDir string) bool {
 	// Check for essential files/directories
@@ -254,14 +239,14 @@ func ValidateDataDirectory(dataDir string) bool {
 		filepath.Join(dataDir, "performance_schema"),
 		filepath.Join(dataDir, "ibdata1"),
 	}
-	
+
 	for _, path := range essentialPaths {
 		if !PathExists(path) {
 			AppLogger.Log("Missing essential file/directory: %s", path)
 			return false
 		}
 	}
-	
+
 	return true
 }
 
@@ -272,7 +257,7 @@ func InitializeDataDir(dataDir string) error {
 	if runtime.GOOS == "windows" {
 		installDbPath += ".exe"
 	}
-	
+
 	if PathExists(installDbPath) {
 		cmd := exec.Command(installDbPath, "--datadir="+dataDir, "--auth-root-authentication-method=normal")
 		output, err := cmd.CombinedOutput()
@@ -283,20 +268,20 @@ func InitializeDataDir(dataDir string) error {
 		AppLogger.Log("Data directory initialized with mysql_install_db")
 		return nil
 	}
-	
+
 	// Try mysqld --initialize-insecure
 	mysqldPath := filepath.Join(AppConfig.MariaDBBin, "mysqld")
 	if runtime.GOOS == "windows" {
 		mysqldPath += ".exe"
 	}
-	
+
 	cmd := exec.Command(mysqldPath, "--initialize-insecure", "--datadir="+dataDir)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		AppLogger.Log("mysqld --initialize-insecure failed: %v\nOutput: %s", err, string(output))
 		return err
 	}
-	
+
 	AppLogger.Log("Data directory initialized with mysqld --initialize-insecure")
 	return nil
 }
@@ -307,7 +292,7 @@ func InitializeDataDirAlternative(dataDir, configFile string) error {
 	if runtime.GOOS == "windows" {
 		mysqldPath += ".exe"
 	}
-	
+
 	// Try with config file
 	cmd := exec.Command(mysqldPath, "--defaults-file="+configFile, "--initialize-insecure")
 	output, err := cmd.CombinedOutput()
@@ -315,7 +300,7 @@ func InitializeDataDirAlternative(dataDir, configFile string) error {
 		AppLogger.Log("Alternative initialization failed: %v\nOutput: %s", err, string(output))
 		return fmt.Errorf("failed to initialize data directory: %v", err)
 	}
-	
+
 	AppLogger.Log("Data directory initialized with alternative method")
 	return nil
 }
@@ -323,7 +308,7 @@ func InitializeDataDirAlternative(dataDir, configFile string) error {
 // ParseMariaDBError parses MariaDB error output for common issues
 func ParseMariaDBError(errorOutput string) string {
 	lowerOutput := strings.ToLower(errorOutput)
-	
+
 	if strings.Contains(lowerOutput, "access denied") {
 		return "Access denied - check your credentials"
 	}
@@ -398,7 +383,7 @@ func ExecMySQLQueryWithCredentials(variable string, creds MySQLCredentials) stri
 		AppLogger.Log("MySQL query failed for variable %s: %v", variable, err)
 		return ""
 	}
-	
+
 	result := strings.TrimSpace(string(output))
 	AppLogger.Log("MySQL query for %s returned: %s", variable, result)
 	return result
@@ -407,7 +392,7 @@ func ExecMySQLQueryWithCredentials(variable string, creds MySQLCredentials) stri
 // FindProcessUsingPort finds which process is using a specific port
 func FindProcessUsingPort(port string) {
 	var cmd *exec.Cmd
-	
+
 	switch runtime.GOOS {
 	case "windows":
 		cmd = exec.Command("netstat", "-ano", "-p", "TCP")
@@ -416,13 +401,13 @@ func FindProcessUsingPort(port string) {
 	default:
 		cmd = exec.Command("netstat", "-tlnp")
 	}
-	
+
 	output, err := cmd.Output()
 	if err != nil {
 		AppLogger.Log("Failed to run port check command: %v", err)
 		return
 	}
-	
+
 	lines := strings.Split(string(output), "\n")
 	for _, line := range lines {
 		if strings.Contains(line, ":"+port) {
@@ -449,7 +434,7 @@ func StopMacService() error {
 	if err := cmd.Run(); err == nil {
 		return nil
 	}
-	
+
 	// Try brew services
 	cmd = exec.Command("brew", "services", "stop", "mariadb")
 	return cmd.Run()

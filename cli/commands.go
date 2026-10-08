@@ -8,8 +8,8 @@ import (
 	"strings"
 	"syscall"
 
-	"mariadb-monitor/core"
 	"golang.org/x/term"
+	"mariadb-monitor/core"
 )
 
 // CLI represents the command-line interface
@@ -24,42 +24,42 @@ func NewCLI() *CLI {
 func (c *CLI) List() error {
 	fmt.Println("Available MariaDB Configurations:")
 	fmt.Println("=================================")
-	
+
 	if len(core.AvailableConfigs) == 0 {
 		fmt.Println("No configurations found.")
 		fmt.Printf("Configuration directory: %s\n", core.AppConfig.ConfigPath)
 		fmt.Println("Add .ini or .cnf files to this directory to create configurations.")
 		return nil
 	}
-	
+
 	// Get current status to mark active config
 	status := core.GetMariaDBStatus()
-	
+
 	for i, config := range core.AvailableConfigs {
 		fmt.Printf("%d. %s", i+1, config.Name)
-		
+
 		if config.Description != "" {
 			fmt.Printf(" (%s)", config.Description)
 		}
-		
+
 		fmt.Printf("\n   Port: %s", config.Port)
-		
+
 		if config.DataDir != "" {
 			fmt.Printf("\n   Data: %s", config.DataDir)
 		}
-		
+
 		fmt.Printf("\n   File: %s", config.Path)
-		
+
 		// Mark active configuration (normalize paths for comparison)
 		if status.IsRunning && filepath.Clean(config.Path) == filepath.Clean(status.ConfigFile) {
 			fmt.Printf("\n   Status: ✓ ACTIVE (PID: %d)", status.ProcessID)
 		} else {
 			fmt.Printf("\n   Status: Available")
 		}
-		
+
 		fmt.Println()
 	}
-	
+
 	return nil
 }
 
@@ -67,9 +67,9 @@ func (c *CLI) List() error {
 func (c *CLI) Status() error {
 	fmt.Println("MariaDB Status:")
 	fmt.Println("===============")
-	
+
 	status := core.GetMariaDBStatus()
-	
+
 	if status.IsRunning {
 		fmt.Printf("Status: ✓ RUNNING\n")
 		fmt.Printf("Process ID: %d\n", status.ProcessID)
@@ -84,14 +84,21 @@ func (c *CLI) Status() error {
 	} else {
 		fmt.Printf("Status: ✗ STOPPED\n")
 	}
-	
+
+	// Report a server that stopped without exiting: it is invisible otherwise,
+	// and it used to make every later switch time out.
+	for _, pid := range status.StaleProcessIDs {
+		fmt.Printf("\n⚠ Server process %d is present but accepting no connections.\n", pid)
+		fmt.Println("  It stopped without exiting; ending it is safe once it holds no data directory.")
+	}
+
 	return nil
 }
 
 // Switch switches to a different configuration
 func (c *CLI) Switch(configName string) error {
 	fmt.Printf("Switching to configuration: %s\n", configName)
-	
+
 	// Find the configuration
 	var targetConfig *core.MariaDBConfig
 	for _, config := range core.AvailableConfigs {
@@ -100,11 +107,11 @@ func (c *CLI) Switch(configName string) error {
 			break
 		}
 	}
-	
+
 	if targetConfig == nil {
 		return fmt.Errorf("configuration '%s' not found", configName)
 	}
-	
+
 	// Check if MariaDB is currently running
 	running, err := core.IsMariaDBRunningE()
 	if err != nil {
@@ -123,11 +130,11 @@ func (c *CLI) Switch(configName string) error {
 			return fmt.Errorf("failed to stop current MariaDB instance: %v", err)
 		}
 
-		// Wait for the port the new instance needs, not just for the process:
-		// the old server releases its port a moment after it exits.
+		// Wait for the server that was stopped, and for the port the new
+		// instance needs, which is released a moment after it exits.
 		fmt.Println("Waiting for shutdown to complete...")
 		core.AppLogger.Log("Waiting for complete shutdown before switching...")
-		if err := core.WaitForMariaDBStopped(targetConfig.Port, core.ShutdownTimeout()); err != nil {
+		if err := core.WaitForMariaDBStopped(status.ProcessID, targetConfig.Port, core.ShutdownTimeout()); err != nil {
 			return err
 		}
 	}
@@ -138,13 +145,13 @@ func (c *CLI) Switch(configName string) error {
 	if err := core.StartMariaDBWithConfig(targetConfig.Path); err != nil {
 		return fmt.Errorf("failed to start MariaDB: %v", err)
 	}
-	
+
 	fmt.Printf("✓ Successfully switched to %s configuration\n", targetConfig.Name)
 	fmt.Printf("  Port: %s\n", targetConfig.Port)
 	if targetConfig.DataDir != "" {
 		fmt.Printf("  Data Directory: %s\n", targetConfig.DataDir)
 	}
-	
+
 	return nil
 }
 
@@ -153,7 +160,7 @@ func (c *CLI) Start(configName string) error {
 	if configName == "" {
 		return fmt.Errorf("configuration name is required")
 	}
-	
+
 	// Find the configuration
 	var targetConfig *core.MariaDBConfig
 	for _, config := range core.AvailableConfigs {
@@ -162,11 +169,11 @@ func (c *CLI) Start(configName string) error {
 			break
 		}
 	}
-	
+
 	if targetConfig == nil {
 		return fmt.Errorf("configuration '%s' not found", configName)
 	}
-	
+
 	// Check if already running
 	running, err := core.IsMariaDBRunningE()
 	if err != nil {
@@ -185,11 +192,11 @@ func (c *CLI) Start(configName string) error {
 	if err := core.StartMariaDBWithConfig(targetConfig.Path); err != nil {
 		return fmt.Errorf("failed to start MariaDB: %v", err)
 	}
-	
+
 	fmt.Printf("✓ MariaDB started successfully\n")
 	fmt.Printf("  Configuration: %s\n", targetConfig.Name)
 	fmt.Printf("  Port: %s\n", targetConfig.Port)
-	
+
 	return nil
 }
 

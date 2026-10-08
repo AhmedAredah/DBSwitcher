@@ -1,7 +1,6 @@
 package core
 
 import (
-	"bytes"
 	"net"
 	"os"
 	"runtime"
@@ -112,23 +111,4 @@ func IsPortListening(port string) bool {
 		}
 	}
 	return false
-}
-
-// syncBuffer is a bytes.Buffer that stays safe to read while the copy
-// goroutines started by os/exec are still writing into it.
-type syncBuffer struct {
-	mu  sync.Mutex
-	buf bytes.Buffer
-}
-
-func (b *syncBuffer) Write(p []byte) (int, error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.buf.Write(p)
-}
-
-func (b *syncBuffer) String() string {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.buf.String()
 }

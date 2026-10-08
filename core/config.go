@@ -43,15 +43,15 @@ func LoadConfig() {
 		},
 		UseServiceControl: false,
 		RequireElevation:  false,
-		
+
 		// Default UI/Application Settings
-		AutoRefreshEnabled:    true,
-		RefreshIntervalSecs:   5,
-		NotificationsEnabled:  true,
-		StartMinimized:        false,
-		AutoStartWithSystem:   false,
-		LogLevel:              "INFO",
-		
+		AutoRefreshEnabled:   true,
+		RefreshIntervalSecs:  5,
+		NotificationsEnabled: true,
+		StartMinimized:       false,
+		AutoStartWithSystem:  false,
+		LogLevel:             "INFO",
+
 		// Default Advanced Settings
 		ProcessTimeoutSecs:    30,
 		MaxRetryAttempts:      3,
@@ -258,4 +258,43 @@ func FindConfigByPath(path string) *MariaDBConfig {
 		}
 	}
 	return nil
+}
+
+// findConfigByDataDir matches a running server's own configuration file to a
+// known configuration by the data directory it serves.
+//
+// Identifying a server only by the path of its --defaults-file misses any
+// server DBSwitcher did not start - the Windows service runs from its own
+// my.ini. The data directory is what actually says which database is being
+// served, and therefore which credentials apply to it.
+func findConfigByDataDir(configFile string) *MariaDBConfig {
+	if configFile == "" || !PathExists(configFile) {
+		return nil
+	}
+
+	running := ParseConfigFile(configFile)
+	if running.DataDir == "" {
+		return nil
+	}
+
+	for _, cfg := range AvailableConfigs {
+		if cfg.DataDir != "" && sameDirectory(cfg.DataDir, running.DataDir) {
+			match := cfg
+			return &match
+		}
+	}
+
+	return nil
+}
+
+// sameDirectory compares two directory paths, tolerating separator and case
+// differences on Windows.
+func sameDirectory(a, b string) bool {
+	cleanA := filepath.Clean(a)
+	cleanB := filepath.Clean(b)
+
+	if runtime.GOOS == "windows" {
+		return strings.EqualFold(cleanA, cleanB)
+	}
+	return cleanA == cleanB
 }

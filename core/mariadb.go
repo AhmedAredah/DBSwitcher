@@ -18,6 +18,10 @@ import (
 type ProcessInfo struct {
 	PID         int
 	CommandLine string
+
+	// Port is a TCP port the process listens on, empty when it accepts no
+	// connections.
+	Port string
 }
 
 // GetMariaDBStatus returns the current MariaDB status
@@ -26,13 +30,26 @@ func GetMariaDBStatus() MariaDBStatus {
 		IsRunning: false,
 	}
 
-	proc, found := FindServerProcess()
-	status.IsRunning = found
-
-	if !status.IsRunning {
+	procs, err := FindServerProcesses()
+	if err != nil {
+		AppLogger.Warn("Process detection failed: %v", err)
 		return status
 	}
 
+	// Surface a server that stopped without exiting rather than letting it
+	// silently block the next switch.
+	for _, stale := range StaleServers(procs) {
+		status.StaleProcessIDs = append(status.StaleProcessIDs, stale.PID)
+		AppLogger.Warn("Server process %d is present but not accepting connections", stale.PID)
+	}
+
+	serving := ServingServers(procs)
+	if len(serving) == 0 {
+		return status
+	}
+
+	proc := serving[0]
+	status.IsRunning = true
 	status.ProcessID = proc.PID
 
 	// Log the command line for debugging
@@ -63,6 +80,22 @@ func GetMariaDBStatus() MariaDBStatus {
 		}
 
 		if status.ConfigName == "" {
+			// The server may have been started from a configuration file
+			// DBSwitcher does not manage - the Windows service runs from its
+			// own my.ini. Match it by data directory instead, so the server is
+			// named correctly and the credentials for that database are the
+			// ones used to stop it.
+			if cfg := findConfigByDataDir(configFile); cfg != nil {
+				status.ConfigName = cfg.Name
+				status.DataPath = cfg.DataDir
+				if status.Port == "" {
+					status.Port = cfg.Port
+				}
+				AppLogger.Log("Running server serves the same data directory as configuration '%s'", cfg.Name)
+			}
+		}
+
+		if status.ConfigName == "" {
 			AppLogger.Debug("No matching config found for file: %s", configFile)
 			AppLogger.Debug(" Available configs:")
 			for _, cfg := range AvailableConfigs {
@@ -71,12 +104,12 @@ func GetMariaDBStatus() MariaDBStatus {
 		}
 	}
 
-	// Always confirm the port against the live server; a config file can be
-	// edited after the server was started.
-	if status.Port == "" || !IsPortListening(status.Port) {
-		if detected := getCurrentPort(); detected != "" {
-			status.Port = detected
-		}
+	// The port the server actually listens on wins over the one in the config
+	// file, which can be edited after the server was started.
+	if proc.Port != "" {
+		status.Port = proc.Port
+	} else if status.Port == "" {
+		status.Port = getCurrentPort()
 	}
 
 	// Try to get version
@@ -85,7 +118,7 @@ func GetMariaDBStatus() MariaDBStatus {
 	return status
 }
 
-// IsMariaDBRunningE reports whether a server process exists.
+// IsMariaDBRunningE reports whether a server is accepting connections.
 //
 // A non-nil error means the lookup itself failed and the state is unknown.
 // Callers that are about to start or stop a server must use this form: the
@@ -96,7 +129,9 @@ func IsMariaDBRunningE() (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	return len(procs) > 0, nil
+	// Presence in the process list is not enough: a server that finished
+	// shutting down but never exited is still listed. See ProcessInfo.IsServing.
+	return len(ServingServers(procs)) > 0, nil
 }
 
 // IsMariaDBRunning is the best-effort form of IsMariaDBRunningE, for status
@@ -110,7 +145,31 @@ func IsMariaDBRunning() bool {
 	return running
 }
 
-// FindServerProcess returns the first running server process, if any.
+// FindServingServer returns the server process that is accepting connections.
+func FindServingServer() (ProcessInfo, bool, error) {
+	procs, err := FindServerProcesses()
+	if err != nil {
+		return ProcessInfo{}, false, err
+	}
+
+	serving := ServingServers(procs)
+	if len(serving) == 0 {
+		return ProcessInfo{}, false, nil
+	}
+	if len(serving) > 1 {
+		AppLogger.Warn("%d servers are accepting connections; acting on PID %d (port %s)",
+			len(serving), serving[0].PID, serving[0].Port)
+	}
+
+	return serving[0], true, nil
+}
+
+// FindServerProcess returns the server that is accepting connections, falling
+// back to any server process when none is.
+//
+// The fallback is for diagnostics only. Taking the first process in the list
+// meant DBSwitcher could report a dead server's configuration - and load its
+// credentials - while a different server was the live one.
 func FindServerProcess() (ProcessInfo, bool) {
 	procs, err := FindServerProcesses()
 	if err != nil {
@@ -120,17 +179,33 @@ func FindServerProcess() (ProcessInfo, bool) {
 	if len(procs) == 0 {
 		return ProcessInfo{}, false
 	}
+
+	if serving := ServingServers(procs); len(serving) > 0 {
+		return serving[0], true
+	}
 	return procs[0], true
 }
 
-// FindServerProcesses returns every running MariaDB/MySQL server process.
+// FindServerProcesses returns every running MariaDB/MySQL server process,
+// annotated with the port each one listens on.
 func FindServerProcesses() ([]ProcessInfo, error) {
+	var (
+		procs []ProcessInfo
+		err   error
+	)
+
 	switch runtime.GOOS {
 	case "windows":
-		return findWindowsProcesses(serverProcessNames())
+		procs, err = findWindowsProcesses(serverProcessNames())
 	default:
-		return findUnixProcesses(serverProcessNames())
+		procs, err = findUnixProcesses(serverProcessNames())
 	}
+	if err != nil {
+		return nil, err
+	}
+
+	annotateListeningPorts(procs)
+	return procs, nil
 }
 
 // serverProcessNames lists the executable names a server may run under.
@@ -314,21 +389,19 @@ func ShutdownTimeout() time.Duration {
 // WaitForMariaDBStopped blocks until no server process remains and port is
 // free again. The old code assumed a fixed three second sleep was enough,
 // which it is not for a multi-gigabyte buffer pool.
-func WaitForMariaDBStopped(port string, timeout time.Duration) error {
+func WaitForMariaDBStopped(pid int, port string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	lastState := "unknown"
 
 	for {
-		running, err := IsMariaDBRunningE()
 		switch {
-		case err != nil:
-			lastState = fmt.Sprintf("process state unknown: %v", err)
-		case running:
-			lastState = "server process is still running"
+		case pid > 0 && ServerProcessAlive(pid):
+			lastState = fmt.Sprintf("server process %d has not exited", pid)
 		case port != "" && !IsPortAvailable(port):
 			lastState = fmt.Sprintf("port %s is still in use", port)
 		default:
 			AppLogger.Log("MariaDB has stopped and port %s is free", port)
+			reportStaleServers()
 			return nil
 		}
 
@@ -385,14 +458,14 @@ func getCurrentPort() string {
 
 	// Method 4: Check common ports in order of likelihood
 	commonPorts := []string{"3306", "3307", "3308", "3309", "3310"}
-	
+
 	for _, port := range commonPorts {
 		if IsPortListening(port) {
 			AppLogger.Debug(" Found service listening on port %s", port)
 			return port
 		}
 	}
-	
+
 	AppLogger.Debug(" Could not determine port, defaulting to 3306")
 	return "3306" // Default fallback
 }
@@ -461,7 +534,7 @@ func queryDatabasePort() string {
 // getPortFromNetstat attempts to find MariaDB port from netstat output
 func getPortFromNetstat() string {
 	var cmd *exec.Cmd
-	
+
 	switch runtime.GOOS {
 	case "windows":
 		cmd = exec.Command("netstat", "-ano")
@@ -486,10 +559,10 @@ func getPortFromNetstat() string {
 	for _, line := range lines {
 		if strings.Contains(line, "LISTENING") || strings.Contains(line, "LISTEN") {
 			fields := strings.Fields(line)
-			
+
 			// Windows format: TCP 0.0.0.0:3306 0.0.0.0:0 LISTENING 1234
 			// Unix format: tcp 0 0 0.0.0.0:3306 0.0.0.0:* LISTEN 1234/mysqld
-			
+
 			var localAddr, processInfo string
 			if runtime.GOOS == "windows" {
 				if len(fields) >= 5 {
@@ -569,18 +642,19 @@ func StartMariaDBWithConfig(configFile string) error {
 	AppLogger.Log("========================================")
 	AppLogger.Log("STARTING MARIADB")
 	AppLogger.Log("========================================")
-	
-	// Check if MariaDB is already running. A failed lookup aborts the start:
-	// launching on top of a live server corrupts nothing but does leave the
-	// user with a confusing "process not found" after the port bind fails.
-	running, err := IsMariaDBRunningE()
+
+	// Refuse to start on top of a server that is actually serving. A failed
+	// lookup aborts too: acting on an unknown state is what left users with a
+	// confusing "process not found" after the port bind failed.
+	serving, isServing, err := FindServingServer()
 	if err != nil {
 		AppLogger.Error(" Cannot determine whether MariaDB is running: %v", err)
 		return fmt.Errorf("cannot determine whether MariaDB is running: %v", err)
 	}
-	if running {
-		AppLogger.Log("MariaDB is already running")
-		return fmt.Errorf("MariaDB is already running - please stop it first")
+	if isServing {
+		AppLogger.Log("MariaDB is already running (PID %d, port %s)", serving.PID, serving.Port)
+		return fmt.Errorf("MariaDB is already running on port %s (PID %d) - please stop it first",
+			serving.Port, serving.PID)
 	}
 
 	// Validate config.MariaDBBin
@@ -598,11 +672,11 @@ func StartMariaDBWithConfig(configFile string) error {
 	// Build full mysqld path
 	mysqldPath := filepath.Join(AppConfig.MariaDBBin, GetExecutableName("mysqld"))
 	AppLogger.Log("Full mysqld path: %s", mysqldPath)
-	
+
 	// Check if mysqld exists
 	if !PathExists(mysqldPath) {
 		AppLogger.Error(" mysqld not found at: %s", mysqldPath)
-		
+
 		// Try mariadbd as alternative
 		mariadbdPath := filepath.Join(AppConfig.MariaDBBin, GetExecutableName("mariadbd"))
 		if PathExists(mariadbdPath) {
@@ -616,7 +690,7 @@ func StartMariaDBWithConfig(configFile string) error {
 			} else {
 				findCmd = exec.Command("which", "mysqld")
 			}
-			
+
 			if output, err := findCmd.Output(); err == nil {
 				foundPath := strings.TrimSpace(string(output))
 				AppLogger.Log("Found mysqld at: %s", foundPath)
@@ -642,11 +716,17 @@ func StartMariaDBWithConfig(configFile string) error {
 	}
 	AppLogger.Log("Absolute config file path: %s", absConfigFile)
 
+	// The server's own log file is named after the configuration it serves.
+	configName := ""
+	if cfg := FindConfigByPath(absConfigFile); cfg != nil {
+		configName = cfg.Name
+	}
+
 	// Parse config first to validate it
 	AppLogger.Log("Parsing configuration file...")
 	configData := ParseConfigFile(configFile)
 	AppLogger.Log("Config parsed - DataDir: %s, Port: %s", configData.DataDir, configData.Port)
-	
+
 	// Validate and prepare data directory
 	if configData.DataDir != "" {
 		// Convert to absolute path if relative
@@ -681,14 +761,21 @@ func StartMariaDBWithConfig(configFile string) error {
 		}
 	}
 
-	// Check if MySQL/MariaDB is still running - no force stop
-	AppLogger.Log("Checking if all MySQL/MariaDB processes are stopped...")
-	running, err = IsMariaDBRunningE()
+	// Re-check now that the data directory work is done: nothing may be
+	// serving. A process that stopped without exiting is reported but does not
+	// block the start - it holds no port and no data directory, and demanding
+	// an empty process list made such a leftover break every switch.
+	AppLogger.Log("Checking that no MySQL/MariaDB server is serving...")
+	procs, err := FindServerProcesses()
 	if err != nil {
 		return fmt.Errorf("cannot determine whether MariaDB is running: %v", err)
 	}
-	if running {
-		return fmt.Errorf("MySQL/MariaDB is still running - please stop it gracefully with credentials before starting a new instance")
+	if live := ServingServers(procs); len(live) > 0 {
+		return fmt.Errorf("MySQL/MariaDB is still running on port %s (PID %d) - stop it gracefully with credentials before starting a new instance",
+			live[0].Port, live[0].PID)
+	}
+	for _, stale := range StaleServers(procs) {
+		AppLogger.Warn("Ignoring server process %d, which is not accepting connections", stale.PID)
 	}
 
 	// Double-check the port is free
@@ -700,54 +787,61 @@ func StartMariaDBWithConfig(configFile string) error {
 
 	AppLogger.Log("Port %s is confirmed available", configData.Port)
 
-	// First, try to validate the config file syntax
-	AppLogger.Log("Validating configuration file syntax...")
-	if err := ValidateConfigFile(mysqldPath, absConfigFile); err != nil {
-		AppLogger.Warn(" Config file validation failed: %v", err)
-		// Continue anyway, as some versions don't support --validate-config
-	}
+	// No --validate-config probe: MariaDB has no such option (it is a MySQL 8
+	// flag), and running it started a whole server that initialised InnoDB and
+	// rewrote ibtmp1 inside the data directory before aborting with "unknown
+	// option". The server's own log, read below, is the better signal.
 
 	// Start the MariaDB process with better error capture
 	AppLogger.Log("Starting MariaDB with configuration...")
-	
+
 	// Create command with proper arguments
 	args := []string{
 		fmt.Sprintf("--defaults-file=%s", absConfigFile),
 		"--console", // Add console output for debugging
 	}
-	
+
 	cmd := exec.Command(mysqldPath, args...)
 
-	// Capture both stdout and stderr. The buffers are read below while the
-	// copy goroutines started by os/exec may still be writing, so they have to
-	// be synchronised.
-	var stdout, stderr syncBuffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
+	// Send the server's output to a file, never to a pipe owned by this
+	// process. The server is detached and outlives this one, so os/exec would
+	// hand it a pipe whose reader disappears when this process exits; the
+	// server can then block on its own log writes and never finish shutting
+	// down. That is how servers were left alive with no listener, refusing to
+	// exit, and blocking every later switch.
+	serverLog, logOffset, err := openServerLog(configName)
+	if err != nil {
+		return err
+	}
+	defer serverLog.Close() // the child keeps its own handle
+	cmd.Stdout = serverLog
+	cmd.Stderr = serverLog
+	AppLogger.Log("Server output: %s", serverLog.Name())
 
 	// Set working directory to bin directory
 	cmd.Dir = AppConfig.MariaDBBin
-	
+
 	// Platform-specific configuration
 	if runtime.GOOS == "windows" {
 		// Use CREATE_NEW_PROCESS_GROUP to detach process from parent
 		cmd.SysProcAttr = &syscall.SysProcAttr{
-			HideWindow:    true, // Hide console window
+			HideWindow:    true,       // Hide console window
 			CreationFlags: 0x00000200, // CREATE_NEW_PROCESS_GROUP - allows process to survive parent termination
 		}
 	}
-	
+
 	AppLogger.Log("Executing command: %s %s", mysqldPath, strings.Join(args, " "))
-	
+
 	// Start the process
 	err = cmd.Start()
 	if err != nil {
 		AppLogger.Error(" Failed to start process: %v", err)
 		return fmt.Errorf("failed to start MariaDB: %v", err)
 	}
-	
-	AppLogger.Log("Process started with PID: %d", cmd.Process.Pid)
-	
+
+	startedPID := cmd.Process.Pid
+	AppLogger.Log("Process started with PID: %d", startedPID)
+
 	// Release the process so it's detached from parent and can survive parent termination
 	err = cmd.Process.Release()
 	if err != nil {
@@ -756,7 +850,7 @@ func StartMariaDBWithConfig(configFile string) error {
 	} else {
 		AppLogger.Log("Process successfully detached from parent")
 	}
-	
+
 	// Brief wait to allow process to initialize before verification
 	initWaitTime := 3
 	if AppConfig.ProcessTimeoutSecs > 10 {
@@ -764,7 +858,7 @@ func StartMariaDBWithConfig(configFile string) error {
 	}
 	AppLogger.Info("Waiting %d seconds for MariaDB to initialize...", initWaitTime)
 	time.Sleep(time.Duration(initWaitTime) * time.Second)
-	
+
 	// Additional verification - try to connect
 	AppLogger.Info("Verifying MariaDB is accessible...")
 	maxRetries := AppConfig.MaxRetryAttempts
@@ -772,7 +866,7 @@ func StartMariaDBWithConfig(configFile string) error {
 		maxRetries = 3 // fallback
 	}
 	for i := 0; i < maxRetries; i++ {
-		if IsMariaDBRunning() && IsPortListening(configData.Port) {
+		if IsPortListening(configData.Port) {
 			AppLogger.Log("MariaDB is running and accepting connections")
 			break
 		}
@@ -780,47 +874,41 @@ func StartMariaDBWithConfig(configFile string) error {
 		time.Sleep(1 * time.Second)
 	}
 
-	// Final verification
-	if !IsMariaDBRunning() {
-		stdoutStr := stdout.String()
-		stderrStr := stderr.String()
-		AppLogger.Error(" MariaDB process not found after startup")
-		if stdoutStr != "" {
-			AppLogger.Log("Final stdout: %s", stdoutStr)
-		}
-		if stderrStr != "" {
-			AppLogger.Log("Final stderr: %s", stderrStr)
+	// Final verification: the server has to be reachable, not merely present
+	// in the process list.
+	if !IsPortListening(configData.Port) {
+		serverOutput := readServerLogFrom(serverLog.Name(), logOffset)
+		if serverOutput != "" {
+			AppLogger.Error(" Server output: %s", serverOutput)
 		}
 
-		// Report why the server gave up instead of the unhelpful
-		// "process not found".
-		serverOutput := stderrStr
-		if serverOutput == "" {
-			serverOutput = stdoutStr
+		if ServerProcessAlive(startedPID) {
+			return fmt.Errorf("MariaDB started (PID %d) but is not accepting connections on port %s - see %s",
+				startedPID, configData.Port, serverLog.Name())
 		}
 		if serverOutput != "" {
 			return fmt.Errorf("MariaDB failed to start: %s", ParseMariaDBError(serverOutput))
 		}
-		return fmt.Errorf("MariaDB failed to start - process not found. Check logs for details")
+		return fmt.Errorf("MariaDB failed to start - see %s", serverLog.Name())
 	}
 
 	// Save the last used config
 	AppConfig.LastUsedConfig = absConfigFile
 	SaveConfig()
-	
+
 	// Update global status
 	CurrentStatus = GetMariaDBStatus()
-	
+
 	AppLogger.Info("========================================")
 	AppLogger.Info("MARIADB STARTED SUCCESSFULLY")
 	AppLogger.Info("========================================")
-	
+
 	// Show success notification
 	if config := FindConfigByPath(absConfigFile); config != nil {
 		NotifyMariaDBStarted(config.Name)
 	} else {
 		NotifyMariaDBStarted("Unknown")
 	}
-	
+
 	return nil
 }

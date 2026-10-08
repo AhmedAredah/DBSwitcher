@@ -10,15 +10,15 @@ type Config struct {
 	AutoDetected      bool              `json:"auto_detected"`
 	UseServiceControl bool              `json:"use_service_control"`
 	RequireElevation  bool              `json:"require_elevation"`
-	
+
 	// UI/Application Settings
-	AutoRefreshEnabled    bool   `json:"auto_refresh_enabled"`
-	RefreshIntervalSecs   int    `json:"refresh_interval_seconds"`
-	NotificationsEnabled  bool   `json:"notifications_enabled"`
-	StartMinimized        bool   `json:"start_minimized"`
-	AutoStartWithSystem   bool   `json:"auto_start_with_system"`
-	LogLevel              string `json:"log_level"`
-	
+	AutoRefreshEnabled   bool   `json:"auto_refresh_enabled"`
+	RefreshIntervalSecs  int    `json:"refresh_interval_seconds"`
+	NotificationsEnabled bool   `json:"notifications_enabled"`
+	StartMinimized       bool   `json:"start_minimized"`
+	AutoStartWithSystem  bool   `json:"auto_start_with_system"`
+	LogLevel             string `json:"log_level"`
+
 	// Advanced Settings
 	ProcessTimeoutSecs    int  `json:"process_timeout_seconds"`
 	MaxRetryAttempts      int  `json:"max_retry_attempts"`
@@ -41,14 +41,18 @@ type MariaDBConfig struct {
 
 // MariaDBStatus represents the current state
 type MariaDBStatus struct {
-	IsRunning   bool   `json:"is_running"`
-	ConfigFile  string `json:"config_file"`  // Current config file path
-	ConfigName  string `json:"config_name"`  // Friendly name of config
-	DataPath    string `json:"data_path"`
-	ProcessID   int    `json:"process_id"`
-	Port        string `json:"port"`
-	ServiceName string `json:"service_name,omitempty"`
-	Version     string `json:"version,omitempty"`
+	IsRunning  bool   `json:"is_running"`
+	ConfigFile string `json:"config_file"` // Current config file path
+	ConfigName string `json:"config_name"` // Friendly name of config
+	DataPath   string `json:"data_path"`
+	ProcessID  int    `json:"process_id"`
+
+	// StaleProcessIDs are server processes that are present but accepting no
+	// connections: servers that stopped without exiting.
+	StaleProcessIDs []int  `json:"stale_process_ids,omitempty"`
+	Port            string `json:"port"`
+	ServiceName     string `json:"service_name,omitempty"`
+	Version         string `json:"version,omitempty"`
 }
 
 // MySQLCredentials represents database connection credentials
