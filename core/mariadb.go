@@ -732,6 +732,13 @@ func GetDefaultDataDir() string {
 	return ""
 }
 
+// Windows process creation flags for a server that outlives the terminal it
+// was started from.
+const (
+	detachedProcess       = 0x00000008 // DETACHED_PROCESS: no console
+	createNewProcessGroup = 0x00000200 // CREATE_NEW_PROCESS_GROUP
+)
+
 // StartMariaDBWithConfig starts MariaDB with the specified configuration file
 func StartMariaDBWithConfig(configFile string) error {
 	AppLogger.Log("========================================")
@@ -922,10 +929,14 @@ func StartMariaDBWithConfig(configFile string) error {
 
 	// Platform-specific configuration
 	if runtime.GOOS == "windows" {
-		// Use CREATE_NEW_PROCESS_GROUP to detach process from parent
+		// Give the server no console at all. With only a new process group it
+		// shared the console of the terminal it was started from, and closing
+		// that terminal sent it CTRL_CLOSE_EVENT and killed it outright. The
+		// group alone shields it from Ctrl+C, nothing more. Its output goes to
+		// the server log, so it has no use for a console.
 		cmd.SysProcAttr = &syscall.SysProcAttr{
-			HideWindow:    true,       // Hide console window
-			CreationFlags: 0x00000200, // CREATE_NEW_PROCESS_GROUP - allows process to survive parent termination
+			HideWindow:    true,
+			CreationFlags: detachedProcess | createNewProcessGroup,
 		}
 	}
 
