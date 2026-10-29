@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"testing"
+	"time"
 )
 
 func TestPortFromAddress(t *testing.T) {
@@ -135,5 +136,64 @@ func TestServerLogPath(t *testing.T) {
 	unnamed := serverLogPath("")
 	if filepath.Base(unnamed) != "mysqld.log" {
 		t.Errorf("unexpected log name: %s", unnamed)
+	}
+}
+
+func TestParseProcessActivity(t *testing.T) {
+	output := "67252 158006 4218750\r\n\r\nnot a line\r\n33060 12 156250\r\n"
+
+	activity := parseProcessActivity(output)
+	if len(activity) != 2 {
+		t.Fatalf("expected 2 processes, got %d", len(activity))
+	}
+
+	stuck := activity[67252]
+	if stuck.Age != 158006*time.Second {
+		t.Errorf("unexpected age: %s", stuck.Age)
+	}
+	if stuck.CPUTime != 421875*time.Microsecond {
+		t.Errorf("unexpected CPU time: %s", stuck.CPUTime)
+	}
+}
+
+func TestIsHungServer(t *testing.T) {
+	grace := time.Minute
+	idle := processActivity{Age: 2 * time.Hour, CPUTime: time.Second}
+
+	if !isHungServer(idle, idle, grace) {
+		t.Error("an old server using no CPU should count as hung")
+	}
+
+	busy := processActivity{Age: idle.Age, CPUTime: 2 * time.Second}
+	if isHungServer(idle, busy, grace) {
+		t.Error("a server still using CPU - flushing during shutdown - is not hung")
+	}
+
+	young := processActivity{Age: 30 * time.Second, CPUTime: time.Second}
+	if isHungServer(young, young, grace) {
+		t.Error("a server younger than the startup timeout may still be recovering")
+	}
+}
+
+func TestOwnStaleServers(t *testing.T) {
+	saved := AvailableConfigs
+	defer func() { AvailableConfigs = saved }()
+
+	configDir := t.TempDir()
+	external := filepath.Join(configDir, "external.ini")
+	AvailableConfigs = []MariaDBConfig{{Name: "external", Path: external}}
+
+	stale := []ProcessInfo{
+		{PID: 1, CommandLine: `mysqld.exe --defaults-file=` + external + ` --console`},
+		{PID: 2, CommandLine: `"mysqld.exe" "--defaults-file=C:\ProgramData\MariaDB\MariaDB 11.4\data\my.ini" "MariaDB11_4"`},
+		{PID: 3, CommandLine: `mysqld.exe --defaults-file=` + external + ` --console`},
+		{PID: 4, CommandLine: `mysqld.exe --defaults-file=` + external, Port: "3306"},
+		{PID: 5, CommandLine: `mysqld.exe --console`},
+	}
+	services := []ServiceInfo{{Name: "MariaDB11_4", PID: 2}, {Name: "Odd", PID: 3}}
+
+	own := ownStaleServers(stale, services)
+	if len(own) != 1 || own[0].PID != 1 {
+		t.Errorf("expected only PID 1, got %+v", own)
 	}
 }

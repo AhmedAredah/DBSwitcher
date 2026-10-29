@@ -449,9 +449,14 @@ func WaitForMariaDBServing(pid int, port string, timeout time.Duration) error {
 // WaitForMariaDBStopped blocks until no server process remains and port is
 // free again. The old code assumed a fixed three second sleep was enough,
 // which it is not for a multi-gigabyte buffer pool.
+//
+// A server whose shutdown hangs - it closes its port and then never exits - is
+// ended once the timeout has passed, rather than failing the switch and being
+// left behind holding its data directory.
 func WaitForMariaDBStopped(pid int, port string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	lastState := "unknown"
+	endedStale := false
 
 	for {
 		switch {
@@ -461,11 +466,17 @@ func WaitForMariaDBStopped(pid int, port string, timeout time.Duration) error {
 			lastState = fmt.Sprintf("port %s is still in use", port)
 		default:
 			AppLogger.Log("MariaDB has stopped and port %s is free", port)
-			reportStaleServers()
+			EndStaleServers()
 			return nil
 		}
 
 		if time.Now().After(deadline) {
+			if !endedStale {
+				endedStale = true
+				if len(EndStaleServers()) > 0 {
+					continue
+				}
+			}
 			return fmt.Errorf("timed out after %s waiting for MariaDB to stop (%s)", timeout, lastState)
 		}
 
@@ -741,6 +752,10 @@ func StartMariaDBWithConfig(configFile string) error {
 			serving.Port, serving.PID)
 	}
 
+	// A server of ours that stopped serving but never exited may still hold
+	// the data directory this start needs.
+	EndStaleServers()
+
 	// Validate config.MariaDBBin
 	if AppConfig.MariaDBBin == "" {
 		AppLogger.Error(" MariaDB binary path is empty!")
@@ -846,9 +861,9 @@ func StartMariaDBWithConfig(configFile string) error {
 	}
 
 	// Re-check now that the data directory work is done: nothing may be
-	// serving. A process that stopped without exiting is reported but does not
-	// block the start - it holds no port and no data directory, and demanding
-	// an empty process list made such a leftover break every switch.
+	// serving. A process that stopped without exiting does not block the start
+	// - demanding an empty process list made such a leftover break every
+	// switch - and ours were already ended above.
 	AppLogger.Log("Checking that no MySQL/MariaDB server is serving...")
 	procs, err := FindServerProcesses()
 	if err != nil {

@@ -38,7 +38,8 @@ A powerful, cross-platform tool for managing multiple MariaDB/MySQL configuratio
 ### Advanced Features
 
 - **Real-time Monitoring**: Live status updates and process monitoring
-- **Windows Service Aware**: A configuration whose data directory is served by a Windows service is started and stopped through the service control manager, not behind its back; pass `--no-service` to force a standalone server
+- **Windows Service Aware**: A configuration whose data directory is served by a Windows service is started and stopped through the service control manager, not behind its back; pass `--no-service` to force a standalone server. Run `dbswitcher service setup` once (it asks for administrator approval) to set such services to manual start, so none claims the port at boot, and to let your account start and stop them without elevation
+- **Stuck Servers Are Ended**: A server DBSwitcher started that has closed its port, used no CPU for a few seconds and is older than the startup timeout is ended before the next start or switch, instead of being left holding its data directory
 - **Health Checks, Not Guesses**: Status asks the server for its protocol greeting, so a process holding an open port is reported as `RUNNING BUT NOT USABLE` rather than healthy, and the version shown is the running server's
 - **Per-Configuration Server Logs**: Each server writes its own output to `mysqld-<config>.log` in the application data directory, so a failed start can be explained
 - **Port Detection**: Intelligent port detection using multiple methods
@@ -191,6 +192,7 @@ description = "Development server for testing"
 | `start <config>` | Start with specified configuration | `dbswitcher start production` |
 | `switch <config>` | Switch to different configuration | `dbswitcher switch development` |
 | `stop` | Stop running MariaDB instance | `dbswitcher stop` |
+| `service setup` | Prepare Windows services for switching (once, as administrator) | `dbswitcher service setup` |
 | `gui` | Launch graphical interface | `dbswitcher gui` |
 | `tray` | Run in system tray mode | `dbswitcher tray` |
 | `version` | Show version information | `dbswitcher version` |

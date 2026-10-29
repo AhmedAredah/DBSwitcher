@@ -171,3 +171,67 @@ func TestServiceToStart(t *testing.T) {
 		t.Error("IsDisabled must follow the start mode")
 	}
 }
+
+func TestGrantServiceControl(t *testing.T) {
+	const sid = "S-1-12-1-4088911202-1247884903-469420460-390641804"
+
+	// The permissions MariaDB11_4 is installed with: interactive users may
+	// query it, but only SYSTEM and administrators may start or stop it.
+	installed := "D:(A;;CCLCSWRPWPDTLOCRRC;;;SY)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)(A;;CCLCSWLOCRRC;;;IU)(A;;CCLCSWLOCRRC;;;SU)"
+
+	granted, changed, err := grantServiceControl(installed, sid)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !changed {
+		t.Fatal("expected access to be added")
+	}
+	want := installed + "(A;;" + serviceControlRights + ";;;" + sid + ")"
+	if granted != want {
+		t.Errorf("got  %s\nwant %s", granted, want)
+	}
+
+	// Running setup again changes nothing.
+	again, changed, err := grantServiceControl(granted, sid)
+	if err != nil || changed || again != granted {
+		t.Errorf("second grant changed the permissions: %q, %v, %v", again, changed, err)
+	}
+
+	// The entry goes into the access list, not after the audit list.
+	withAudit := "O:SYG:SYD:(A;;CCLCSWLOCRRC;;;IU)S:(AU;FA;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;WD)"
+	granted, _, err = grantServiceControl(withAudit, sid)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want = "O:SYG:SYD:(A;;CCLCSWLOCRRC;;;IU)(A;;" + serviceControlRights + ";;;" + sid + ")S:(AU;FA;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;WD)"
+	if granted != want {
+		t.Errorf("got  %s\nwant %s", granted, want)
+	}
+
+	// Query rights alone are not start/stop rights.
+	queryOnly := "D:(A;;CCLCSWLOCRRC;;;" + sid + ")"
+	if _, changed, _ := grantServiceControl(queryOnly, sid); !changed {
+		t.Error("query-only access was taken for start/stop access")
+	}
+
+	if _, _, err := grantServiceControl("O:SYG:SY", sid); err == nil {
+		t.Error("expected an error for permissions without an access list")
+	}
+}
+
+func TestHasRightReadsTwoLetterCodes(t *testing.T) {
+	// "LOCR" contains the letters "OC", which is not one of its codes.
+	if hasRight("LOCR", "OC") {
+		t.Error("matched a code across a boundary")
+	}
+	if !hasRight("CCLCSWRPWPLOCRRC", "WP") {
+		t.Error("missed WP")
+	}
+}
+
+func TestEncodePowerShellCommand(t *testing.T) {
+	// PowerShell's -EncodedCommand takes base64 of UTF-16LE.
+	if got := encodePowerShellCommand("exit 0"); got != "ZQB4AGkAdAAgADAA" {
+		t.Errorf("got %q", got)
+	}
+}

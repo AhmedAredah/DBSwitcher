@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 
@@ -114,7 +115,8 @@ func (c *CLI) Status() error {
 	// and it used to make every later switch time out.
 	for _, pid := range status.StaleProcessIDs {
 		fmt.Printf("\n⚠ Server process %d is present but accepting no connections.\n", pid)
-		fmt.Println("  It stopped without exiting; ending it is safe once it holds no data directory.")
+		fmt.Println("  It stopped without exiting. If it is one of DBSwitcher's own servers and stays idle,")
+		fmt.Println("  the next start or switch ends it.")
 	}
 
 	return nil
@@ -330,7 +332,7 @@ func (c *CLI) stopServiceManagedServer() (handled bool, err error) {
 		// Stopping a service needs elevation, which the tool may not have.
 		fmt.Printf("Could not stop the service: %v\n", err)
 		fmt.Println("Falling back to a graceful shutdown with credentials. Windows will report that the")
-		fmt.Println("service stopped unexpectedly; run DBSwitcher as administrator to avoid that.")
+		fmt.Println("service stopped unexpectedly; run 'dbswitcher service setup' once to avoid that.")
 		return false, nil
 	}
 
@@ -353,6 +355,10 @@ func (c *CLI) startConfig(config *core.MariaDBConfig) error {
 		}
 
 		if err := core.StartMariaDBForConfig(*config, c.UseService); err != nil {
+			if core.ServiceNeedsSetup(service) {
+				fmt.Println("Run 'dbswitcher service setup' once to let DBSwitcher start and stop this service")
+				fmt.Println("without administrator rights.")
+			}
 			return fmt.Errorf("failed to start the %s service: %v", service.Name, err)
 		}
 		return nil
@@ -378,8 +384,71 @@ func (c *CLI) warnAboutServiceOverlap(config *core.MariaDBConfig) {
 	}
 
 	fmt.Printf("Note: Windows service %s serves the same data directory and starts automatically,\n", service.Name)
-	fmt.Printf("      so it will claim port %s again after a reboot. Set it to manual start to avoid that:\n", config.Port)
-	fmt.Printf("      Set-Service -Name %s -StartupType Manual   (as administrator)\n", service.Name)
+	fmt.Printf("      so it will claim port %s again after a reboot. Run 'dbswitcher service setup'\n", config.Port)
+	fmt.Println("      once to set it to manual start.")
+}
+
+// ServiceSetup prepares the Windows services that serve a configuration's data
+// directory for switching: manual start, so none claims its port at boot, and
+// start/stop rights for this user, so switching needs no administrator rights.
+// The changes are made behind a single UAC prompt.
+func (c *CLI) ServiceSetup() error {
+	if runtime.GOOS != "windows" {
+		fmt.Println("Service setup applies to Windows services only; nothing to do.")
+		return nil
+	}
+
+	services, err := core.ServicesForConfigs()
+	if err != nil {
+		return fmt.Errorf("cannot look for services: %v", err)
+	}
+	if len(services) == 0 {
+		fmt.Println("No Windows service serves the data directory of any configuration; nothing to set up.")
+		return nil
+	}
+
+	plans, err := core.PlanServiceSetup(services)
+	if err != nil {
+		return err
+	}
+
+	pending := 0
+	for _, plan := range plans {
+		if !plan.Needed() {
+			fmt.Printf("✓ %s is already set up\n", plan.Service.Name)
+			continue
+		}
+		pending++
+		fmt.Printf("%s:\n", plan.Service.Name)
+		if plan.SetManual {
+			fmt.Println("  - set to manual start, so it no longer claims its port at every boot")
+		}
+		if plan.GrantAccess {
+			fmt.Println("  - allow this user to start and stop it")
+		}
+	}
+	if pending == 0 {
+		return nil
+	}
+
+	fmt.Println("\nWindows will ask for administrator approval...")
+	if err := core.ApplyServiceSetup(plans); err != nil {
+		return err
+	}
+
+	// Check the result rather than trusting the exit code.
+	verified, err := core.PlanServiceSetup(services)
+	if err != nil {
+		return fmt.Errorf("setup ran but could not be checked: %v", err)
+	}
+	for _, plan := range verified {
+		if plan.Needed() {
+			return fmt.Errorf("setup ran but %s still needs changes", plan.Service.Name)
+		}
+	}
+
+	fmt.Println("✓ Services set up; DBSwitcher can now start and stop them without administrator rights.")
+	return nil
 }
 
 // promptForCredentials prompts the user for MySQL credentials. saved is the
@@ -534,7 +603,10 @@ COMMANDS:
     start <config>          Start MariaDB with specified configuration
     switch <config>         Switch to a different configuration (stops current, starts new)
     stop                    Stop the running MariaDB instance
-    gui                     Launch the GUI interface
+    service setup           Set the Windows services that serve a configuration
+                            to manual start and let this user start and stop
+                            them (asks for administrator approval once)
+    gui                    Launch the GUI interface
     tray                    Run in system tray mode
     help                    Show this help message
 

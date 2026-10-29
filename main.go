@@ -131,6 +131,17 @@ func main() {
 			os.Exit(1)
 		}
 
+	case "service":
+		if len(args) < 2 || args[1] != "setup" {
+			fmt.Println("Usage: dbswitcher service setup")
+			os.Exit(1)
+		}
+		if err := cli.ServiceSetup(); err != nil {
+			core.AppLogger.Log("Service setup failed: %v", err)
+			fmt.Printf("Error: %v\n", err)
+			os.Exit(1)
+		}
+
 	case "gui":
 		core.AppLogger.Log("Starting application in GUI mode")
 		if err := gui.Run(); err != nil {
