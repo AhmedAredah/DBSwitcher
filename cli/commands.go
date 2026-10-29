@@ -436,7 +436,13 @@ func (c *CLI) ServiceSetup() error {
 		return err
 	}
 
-	// Check the result rather than trusting the exit code.
+	// Check the result rather than trusting the exit code, against the
+	// services as they are now: the ones read before setup still carry the
+	// old start type.
+	services, err = core.ServicesForConfigs()
+	if err != nil {
+		return fmt.Errorf("setup ran but could not be checked: %v", err)
+	}
 	verified, err := core.PlanServiceSetup(services)
 	if err != nil {
 		return fmt.Errorf("setup ran but could not be checked: %v", err)
