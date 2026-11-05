@@ -2,13 +2,15 @@ module mariadb-monitor
 
 go 1.24.6
 
-require fyne.io/fyne/v2 v2.6.2
+require (
+	fyne.io/fyne/v2 v2.6.2
+	github.com/zalando/go-keyring v0.2.6
+	golang.org/x/term v0.34.0
+)
 
 require (
 	al.essio.dev/pkg/shellescape v1.5.1 // indirect
 	github.com/danieljoos/wincred v1.2.2 // indirect
-	github.com/zalando/go-keyring v0.2.6 // indirect
-	golang.org/x/term v0.34.0 // indirect
 )
 
 require (
@@ -50,7 +52,7 @@ require (
 	github.com/yuin/goldmark v1.7.8 // indirect
 	golang.org/x/image v0.24.0 // indirect
 	golang.org/x/net v0.35.0 // indirect
-	golang.org/x/sys v0.35.0 // indirect
+	golang.org/x/sys v0.35.0
 	golang.org/x/text v0.22.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )

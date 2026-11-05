@@ -2,6 +2,7 @@ package core
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -283,16 +284,34 @@ func findWindowsProcesses(names []string) ([]ProcessInfo, error) {
 	return nil, fmt.Errorf("could not query running processes: %v", lastErr)
 }
 
+// powerShellTimeout bounds a PowerShell query. A wedged WMI provider never
+// answers, and without a limit the command waiting on it hung for good.
+const powerShellTimeout = 30 * time.Second
+
 // runPowerShell runs a PowerShell snippet and treats anything on stderr as a
 // failure, so a broken WMI query can never be read as an empty process list.
 func runPowerShell(script string) (string, error) {
-	cmd := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command", script)
+	return runPowerShellWithin(script, powerShellTimeout)
+}
+
+// runPowerShellWithin is runPowerShell with its own time limit, for commands
+// that wait on a server, such as stopping a service.
+func runPowerShellWithin(script string, timeout time.Duration) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "powershell", "-NoProfile", "-NonInteractive", "-Command", script)
+	// Do not wait on output pipes held open by anything it started.
+	cmd.WaitDelay = 2 * time.Second
 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 
 	if err := cmd.Run(); err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			return "", fmt.Errorf("powershell: no answer after %s", timeout)
+		}
 		detail := strings.TrimSpace(stderr.String())
 		if detail == "" {
 			detail = err.Error()

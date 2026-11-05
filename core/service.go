@@ -1,7 +1,6 @@
 package core
 
 import (
-	"encoding/json"
 	"fmt"
 	"os/exec"
 	"runtime"
@@ -53,35 +52,39 @@ var (
 // switched off, and a service-managed server was stopped behind the service
 // manager's back.
 //
-// Results are cached briefly: this is a PowerShell call, and the status view
-// refreshes on a timer.
+// The services are read from the service control manager itself, not through
+// WMI. A Get-CimInstance Win32_Service query once stopped returning on this
+// machine while the service control manager answered in under a second, and
+// with no time limit on it every switch hung before doing anything.
+//
+// Results are cached briefly, since the status view refreshes on a timer. The
+// lock is not held during the lookup, so one slow lookup cannot hold up every
+// other caller.
 func FindServerServices() ([]ServiceInfo, error) {
 	if runtime.GOOS != "windows" {
 		return nil, nil
 	}
 
 	serviceCacheMu.Lock()
-	defer serviceCacheMu.Unlock()
-
 	if serviceCache != nil && time.Since(serviceCacheTime) < serviceCacheTTL {
-		return serviceCache, nil
+		cached := serviceCache
+		serviceCacheMu.Unlock()
+		return cached, nil
 	}
+	serviceCacheMu.Unlock()
 
-	const query = `Get-CimInstance Win32_Service | Where-Object { $_.PathName -match 'mysqld|mariadbd' } | ` +
-		`Select-Object Name,DisplayName,State,StartMode,ProcessId,PathName | ConvertTo-Json -Compress`
-
-	output, err := runPowerShell(query)
+	services, err := queryServerServices()
 	if err != nil {
 		return nil, fmt.Errorf("could not query services: %v", err)
 	}
-
-	services, err := parseServiceJSON(output)
-	if err != nil {
-		return nil, err
+	if services == nil {
+		services = []ServiceInfo{} // cache "none" as well
 	}
 
+	serviceCacheMu.Lock()
 	serviceCache = services
 	serviceCacheTime = time.Now()
+	serviceCacheMu.Unlock()
 	return services, nil
 }
 
@@ -93,53 +96,64 @@ func RefreshServerServices() {
 	serviceCache = nil
 }
 
-// parseServiceJSON decodes ConvertTo-Json output, which is an object for a
-// single service, an array for several, and empty for none.
-func parseServiceJSON(output string) ([]ServiceInfo, error) {
-	trimmed := strings.TrimSpace(output)
-	if trimmed == "" {
-		return nil, nil
-	}
+// isServerBinary reports whether a service's command line launches a database
+// server.
+func isServerBinary(binaryPath string) bool {
+	lower := strings.ToLower(binaryPath)
+	return strings.Contains(lower, "mysqld") || strings.Contains(lower, "mariadbd")
+}
 
-	type jsonService struct {
-		Name        string `json:"Name"`
-		DisplayName string `json:"DisplayName"`
-		State       string `json:"State"`
-		StartMode   string `json:"StartMode"`
-		ProcessID   int    `json:"ProcessId"`
-		PathName    string `json:"PathName"`
+// newServiceInfo describes a service from what the service control manager
+// reports about it: its state and start type are numeric codes there.
+func newServiceInfo(name, displayName string, state, startType uint32, pid int, binaryPath string) ServiceInfo {
+	return ServiceInfo{
+		Name:        name,
+		DisplayName: displayName,
+		State:       serviceStateName(state),
+		StartMode:   startTypeName(startType),
+		PID:         pid,
+		BinaryPath:  binaryPath,
+		ConfigFile:  extractConfigFromCmdLine(binaryPath),
 	}
+}
 
-	var entries []jsonService
-	if strings.HasPrefix(trimmed, "[") {
-		if err := json.Unmarshal([]byte(trimmed), &entries); err != nil {
-			return nil, fmt.Errorf("cannot parse service list: %v", err)
-		}
-	} else {
-		var single jsonService
-		if err := json.Unmarshal([]byte(trimmed), &single); err != nil {
-			return nil, fmt.Errorf("cannot parse service entry: %v", err)
-		}
-		entries = append(entries, single)
+// serviceStateName names a SERVICE_STATUS current state.
+func serviceStateName(state uint32) string {
+	switch state {
+	case 1:
+		return "Stopped"
+	case 2:
+		return "Start Pending"
+	case 3:
+		return "Stop Pending"
+	case 4:
+		return "Running"
+	case 5:
+		return "Continue Pending"
+	case 6:
+		return "Pause Pending"
+	case 7:
+		return "Paused"
 	}
+	return "Unknown"
+}
 
-	services := make([]ServiceInfo, 0, len(entries))
-	for _, entry := range entries {
-		if entry.Name == "" {
-			continue
-		}
-		services = append(services, ServiceInfo{
-			Name:        entry.Name,
-			DisplayName: entry.DisplayName,
-			State:       entry.State,
-			StartMode:   entry.StartMode,
-			PID:         entry.ProcessID,
-			BinaryPath:  entry.PathName,
-			ConfigFile:  extractConfigFromCmdLine(entry.PathName),
-		})
+// startTypeName names a service start type, in the words Win32_Service used
+// and the rest of this file compares against.
+func startTypeName(startType uint32) string {
+	switch startType {
+	case 0:
+		return "Boot"
+	case 1:
+		return "System"
+	case 2:
+		return "Auto"
+	case 3:
+		return "Manual"
+	case 4:
+		return "Disabled"
 	}
-
-	return services, nil
+	return ""
 }
 
 // ServiceForProcess returns the service that owns a process, if any.
@@ -205,7 +219,7 @@ func StopWindowsService(name string) error {
 
 	command := fmt.Sprintf("Stop-Service -Name '%s' -Force -WarningAction SilentlyContinue -ErrorAction Stop",
 		escapeSingleQuotes(name))
-	if _, err := runPowerShell(command); err != nil {
+	if _, err := runPowerShellWithin(command, ShutdownTimeout()); err != nil {
 		return fmt.Errorf("could not stop service %s: %v", name, err)
 	}
 
@@ -235,7 +249,7 @@ func StartWindowsService(name string) error {
 
 	command := fmt.Sprintf("Start-Service -Name '%s' -WarningAction SilentlyContinue -ErrorAction Stop",
 		escapeSingleQuotes(name))
-	if _, err := runPowerShell(command); err != nil {
+	if _, err := runPowerShellWithin(command, StartupTimeout()); err != nil {
 		return fmt.Errorf("could not start service %s: %v", name, err)
 	}
 

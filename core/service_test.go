@@ -1,7 +1,6 @@
 package core
 
 import (
-	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -33,28 +32,13 @@ func TestExtractConfigFromQuotedCommandLine(t *testing.T) {
 	}
 }
 
-func TestParseServiceJSON(t *testing.T) {
-	servicePath := `"C:\Program Files\MariaDB\MariaDB 11.4in\mysqld.exe" "--defaults-file=C:\ProgramData\MariaDB\MariaDB 11.4\data\my.ini" "MariaDB11_4"`
-	encodedPath, err := json.Marshal(servicePath)
-	if err != nil {
-		t.Fatalf("setup failed: %v", err)
-	}
+func TestNewServiceInfo(t *testing.T) {
+	// What the service control manager reports for MariaDB11_4: running
+	// (state 4), automatic start (type 2), and a command line quoted whole.
+	binaryPath := `"C:\Program Files\MariaDB\MariaDB 11.4\bin\mysqld.exe" "--defaults-file=C:\ProgramData\MariaDB\MariaDB 11.4\data\my.ini" "MariaDB11_4"`
 
-	// A single service comes back as a bare object.
-	output := `{"Name":"MariaDB11_4","DisplayName":"MariaDB11_4","State":"Running","StartMode":"Auto","ProcessId":4242,"PathName":` + string(encodedPath) + `}`
+	service := newServiceInfo("MariaDB11_4", "MariaDB11_4", 4, 2, 4242, binaryPath)
 
-	services, err := parseServiceJSON(output)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if len(services) != 1 {
-		t.Fatalf("expected 1 service, got %d", len(services))
-	}
-
-	service := services[0]
-	if service.Name != "MariaDB11_4" {
-		t.Errorf("unexpected name: %q", service.Name)
-	}
 	if service.PID != 4242 {
 		t.Errorf("unexpected PID: %d", service.PID)
 	}
@@ -70,22 +54,32 @@ func TestParseServiceJSON(t *testing.T) {
 	if service.Describe() != "MariaDB11_4 (auto start)" {
 		t.Errorf("unexpected description: %q", service.Describe())
 	}
+
+	// Stopped (1) and manual (3), as service setup leaves it.
+	manual := newServiceInfo("MariaDB11_4", "", 1, 3, 0, binaryPath)
+	if manual.IsRunning() || manual.StartsAutomatically() || manual.IsDisabled() {
+		t.Error("a stopped manual service must report none of running, automatic or disabled")
+	}
+	if manual.Describe() != "MariaDB11_4 (manual start)" {
+		t.Errorf("unexpected description: %q", manual.Describe())
+	}
+
+	if !newServiceInfo("Off", "", 1, 4, 0, binaryPath).IsDisabled() {
+		t.Error("start type 4 must read as disabled")
+	}
 }
 
-func TestParseServiceJSONArrayAndEmpty(t *testing.T) {
-	services, err := parseServiceJSON(`[{"Name":"A","State":"Stopped","StartMode":"Manual","ProcessId":0,"PathName":"mysqld.exe"},{"Name":"B","State":"Running","StartMode":"Auto","ProcessId":7,"PathName":"mariadbd.exe"}]`)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+func TestIsServerBinary(t *testing.T) {
+	cases := map[string]bool{
+		`"C:\Program Files\MariaDB\MariaDB 11.4\bin\mysqld.exe" "--defaults-file=x"`: true,
+		`C:\Program Files\MariaDB 12\bin\MARIADBD.EXE`:                               true,
+		`C:\Windows\system32\svchost.exe -k netsvcs`:                                 false,
+		``: false,
 	}
-	if len(services) != 2 {
-		t.Fatalf("expected 2 services, got %d", len(services))
-	}
-	if services[0].IsRunning() || services[0].StartsAutomatically() {
-		t.Error("a stopped manual service must report neither")
-	}
-
-	if services, err := parseServiceJSON("  \r\n"); err != nil || len(services) != 0 {
-		t.Errorf("no services must parse as empty, got %v / %v", services, err)
+	for path, want := range cases {
+		if got := isServerBinary(path); got != want {
+			t.Errorf("isServerBinary(%q) = %t, want %t", path, got, want)
+		}
 	}
 }
 
